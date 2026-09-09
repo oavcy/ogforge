@@ -10,8 +10,7 @@
     "typecheck": "tsc --noEmit",
     "check:assets": "./scripts/check-assets.sh",
     "db:local": "wrangler d1 migrations apply snapog-db --local",
-    "db:remote": "wrangler d1 migrations apply snapog-db",
-    "staging:deploy": "wrangler deploy --env staging"
+    "db:remote": "wrangler d1 migrations apply snapog-db"
   },
   "dependencies": {
     "hono": "^4.6.0",

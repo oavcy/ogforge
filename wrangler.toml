@@ -13,41 +13,39 @@ binding = "OG_CACHE"
 bucket_name = "snapog-og-cache"
 
 [vars]
-ENVIRONMENT = "development"
+ENVIRONMENT = "production"
 # Set AUTH_SECRET via `wrangler secret put AUTH_SECRET` for dashboard cookie signing
 
-# Named environments do NOT inherit d1_databases / r2_buckets / vars from the
-# top level — Wrangler treats those keys as non-inheritable. Every environment
-# must therefore repeat its bindings in full, or it deploys with `env.DB` and
-# `env.OG_CACHE` undefined and every request 500s at runtime rather than at
-# build time.
-
-[env.staging]
-name = "snapog-staging"
-
-[[env.staging.d1_databases]]
-binding = "DB"
-database_name = "snapog-db"
-database_id = "84f27d2b-5cf1-49e5-846f-b95b81159058"
-
-[[env.staging.r2_buckets]]
-binding = "OG_CACHE"
-bucket_name = "snapog-og-cache"
-
-[env.staging.vars]
-ENVIRONMENT = "staging"
-
-[env.production]
-name = "snapog"
-
-[[env.production.d1_databases]]
-binding = "DB"
-database_name = "snapog-db"
-database_id = "84f27d2b-5cf1-49e5-846f-b95b81159058"
-
-[[env.production.r2_buckets]]
-binding = "OG_CACHE"
-bucket_name = "snapog-og-cache"
-
-[env.production.vars]
-ENVIRONMENT = "production"
+# There are deliberately NO named environments here. Cycle #13 learned the real
+# rule the hard way: Wrangler treats `d1_databases`, `r2_buckets` and `vars` as
+# NON-INHERITABLE, so a named environment that omits them deploys green and then
+# 500s on every request with `env.DB` undefined. That reasoning is correct and it
+# is why `[env.staging]` repeated its bindings in full.
+#
+# What it did not settle is WHICH database to repeat. The copy carried
+# database_id 84f27d2b… — production. `npm run staging:deploy` was therefore a
+# committed, one-command path to a second worker writing into `inbound_hits`,
+# the only table holding this company's entire inbound evidence, with no column
+# that could tell its rows from real ones. It was never run (`snapog-staging`
+# returned 404), so nothing is contaminated. Removed in Cycle #35 rather than
+# guarded: the safe way to not deploy a staging worker onto the production
+# database is to have no staging environment.
+#
+# `[env.production]` was removed with it. It duplicated this top-level block
+# exactly, was selected by no script (`npm run deploy` passes no `--env`), and
+# its existence is what made the live config's `ENVIRONMENT = "development"`
+# look deliberate. Corrected to "production" — the top-level block is the one
+# that deploys to https://snapog.aoadmin.workers.dev. The var is read nowhere in
+# `src/`, so this is a truth fix, not a behaviour change.
+#
+# If a staging worker is ever genuinely needed: give it its OWN `database_id`
+# and its OWN bucket, and do it in one commit that creates both. A named
+# environment sharing production state is not staging.
+#
+# Measured bound on this removal, because a removal is not a control:
+# `wrangler deploy --dry-run --env staging` on this file exits **0** with only a
+# WARNING ("No environment found ... with name staging") and falls through to
+# THIS top-level block — worker `snapog`. So a stale `--env staging` no longer
+# creates a second writer; it would overwrite production instead. No script
+# passes `--env` any more (that was the same commit), and the warning is loud,
+# but do not read this block as a guard. It is one fewer path, not a gate.
