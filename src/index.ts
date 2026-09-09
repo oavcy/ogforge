@@ -2,6 +2,7 @@
 // Routes: GET /og (image gen), GET / (landing), GET/POST /register, GET /dashboard
 
 import { Hono } from 'hono';
+import type { Context } from 'hono';
 import { generateOGImage, buildCacheKey } from './og/render';
 import {
   landingPage,
@@ -281,37 +282,67 @@ const BRAND_CARD: OGParams = {
 // rather than served stale forever behind the long max-age below.
 const BRAND_CARD_KEY = 'og/brand/v2.png';
 
-app.get('/brand.png', async c => {
-  const cached = await c.env.OG_CACHE.get(BRAND_CARD_KEY);
+// The hero image on the landing page. Cycle #19 found that this slot pointed at
+// `/og?title=…` with no key — so it answered 401 to every human who ever loaded
+// the page, and had done so since the page existed. The page's single most
+// important pixel, the one that shows what the product makes, was a broken-image
+// icon for nineteen cycles.
+//
+// The bug was not the 401. The 401 is correct and stays. The bug was asking an
+// authenticated endpoint to serve an anonymous visitor. Cycle #18 wrote that
+// exact sentence about crawlers, two hundred lines above, and shipped /brand.png
+// to fix it — while this <img> sat unfixed in the file it was editing.
+//
+// So the demo gets the same treatment as the brand card, for the same reason:
+// fixed content, no key, params ignored, no D1, no quota. It renders through
+// buildElement, so it is an output of the API rather than a picture of one.
+// A hand-made mockup here would have hidden the outage indefinitely.
+const DEMO_CARD: OGParams = {
+  title: 'How We Cut Cold-Start Latency by 80%',
+  description:
+    'A walk through the edge-caching path — what we measured, what we changed, and what it cost us.',
+  domain: 'myblog.dev',
+  tag: 'ENGINEERING',
+  author: 'Rendered by OGForge — this is a real API response',
+  theme: 'dark',
+  template: 'default',
+};
+
+const DEMO_CARD_KEY = 'og/demo/v1.png';
+
+// Both static cards share this. Two copies of the R2-cache dance is one copy too
+// many, and the second copy is where the drift starts.
+async function serveStaticCard(
+  c: Context<{ Bindings: Env }>,
+  card: OGParams,
+  cacheKey: string
+): Promise<Response> {
+  const headers = (cacheState: 'HIT' | 'MISS') => ({
+    'Content-Type': 'image/png',
+    'Cache-Control': 'public, max-age=86400, s-maxage=604800',
+    'X-Cache': cacheState,
+    'X-OGForge-Rendered-By': 'ogforge',
+  });
+
+  const cached = await c.env.OG_CACHE.get(cacheKey);
   if (cached) {
-    return new Response(await cached.arrayBuffer(), {
-      headers: {
-        'Content-Type': 'image/png',
-        'Cache-Control': 'public, max-age=86400, s-maxage=604800',
-        'X-Cache': 'HIT',
-        'X-OGForge-Rendered-By': 'ogforge',
-      },
-    });
+    return new Response(await cached.arrayBuffer(), { headers: headers('HIT') });
   }
 
-  const imageResponse = await generateOGImage(BRAND_CARD, false);
+  const imageResponse = await generateOGImage(card, false);
   const imageBuffer = await imageResponse.arrayBuffer();
 
   c.executionCtx.waitUntil(
-    c.env.OG_CACHE.put(BRAND_CARD_KEY, imageBuffer.slice(0), {
+    c.env.OG_CACHE.put(cacheKey, imageBuffer.slice(0), {
       httpMetadata: { contentType: 'image/png' },
     })
   );
 
-  return new Response(imageBuffer, {
-    headers: {
-      'Content-Type': 'image/png',
-      'Cache-Control': 'public, max-age=86400, s-maxage=604800',
-      'X-Cache': 'MISS',
-      'X-OGForge-Rendered-By': 'ogforge',
-    },
-  });
-});
+  return new Response(imageBuffer, { headers: headers('MISS') });
+}
+
+app.get('/brand.png', c => serveStaticCard(c, BRAND_CARD, BRAND_CARD_KEY));
+app.get('/demo.png', c => serveStaticCard(c, DEMO_CARD, DEMO_CARD_KEY));
 
 // ── Registration ──────────────────────────────────────────────────────────────
 app.get('/register', _c => htmlResponse(registerPage()));
@@ -514,7 +545,14 @@ app.post('/admin/upgrade', async c => {
 app.get('/dashboard', async c => {
   const rawKey = c.req.query('key');
   if (!rawKey) {
-    return htmlResponse(registerPage('Enter your API key or create a new one below'), 400);
+    // 200, not 400. Every page's nav links here, so this is the ordinary way a
+    // stranger arrives — and what they get back is a usable page asking for
+    // their key, which is a normal page state, not a malformed request. Cycle
+    // #19's asset checker flagged this on its first production run: a nav link
+    // present on every page that answered 4xx to everyone who clicked it.
+    // Reserve 4xx for requests that are actually wrong (see the 404 below, for
+    // a key that was supplied and does not exist).
+    return htmlResponse(registerPage('Enter your API key or create a new one below'));
   }
 
   const apiKey = await resolveApiKey(c.env.DB, rawKey);
@@ -539,6 +577,79 @@ app.get('/dashboard', async c => {
 });
 
 // ── Health / ops ──────────────────────────────────────────────────────────────
+// ── Files every stranger's browser and every crawler asks for ────────────────
+// Cycle #19 swept the external surface anonymously for the first time and found
+// all three of these missing: /favicon.ico and /sitemap.xml were 404, and
+// /robots.txt was answered by something upstream of this Worker with 1.2KB of
+// content-signal boilerplate containing zero actual directives — no User-agent,
+// no Allow, no Sitemap. We had never served, or read, any of them.
+
+// The mark is the product's own subject: a 1200×630 card. Amber on near-black,
+// matching the site. Drawn as geometry rather than a glyph because "OG" is
+// illegible at 16px, while an aspect-ratio frame with a content block still
+// reads as a distinct silhouette in a crowded tab strip.
+const FAVICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <rect width="32" height="32" rx="7" fill="#0A0A0A"/>
+  <rect x="6" y="9.5" width="20" height="13" rx="2" fill="none" stroke="#F59E0B" stroke-width="2"/>
+  <rect x="9" y="17" width="9" height="2.5" rx="1.25" fill="#F59E0B"/>
+  <circle cx="21.5" cy="14" r="2" fill="#F59E0B"/>
+</svg>`;
+
+app.get('/favicon.svg', _c =>
+  new Response(FAVICON_SVG, {
+    headers: {
+      'Content-Type': 'image/svg+xml; charset=utf-8',
+      'Cache-Control': 'public, max-age=86400',
+    },
+  })
+);
+
+// Browsers and link unfurlers still probe the bare /favicon.ico path regardless
+// of what <link rel="icon"> says, so that path must not 404.
+app.get('/favicon.ico', c => c.redirect('/favicon.svg', 301));
+
+// Ours, with directives that actually exist. Disallowing /dashboard and
+// /register keeps authenticated and form-only pages out of indexes; they are
+// useless as search results and /dashboard 400s without a key anyway.
+app.get('/robots.txt', c => {
+  const site = origin(c.req.url);
+  const body = [
+    'User-agent: *',
+    'Allow: /',
+    'Disallow: /dashboard',
+    'Disallow: /register',
+    'Disallow: /admin/',
+    '',
+    `Sitemap: ${site}/sitemap.xml`,
+    '',
+  ].join('\n');
+  return new Response(body, {
+    headers: {
+      'Content-Type': 'text/plain; charset=utf-8',
+      'Cache-Control': 'public, max-age=3600',
+      'X-OGForge-Robots': 'ogforge-worker',
+    },
+  });
+});
+
+// Only the two pages worth indexing. /register is a form and /dashboard needs a
+// key, so neither belongs here.
+app.get('/sitemap.xml', c => {
+  const site = origin(c.req.url);
+  const body = `<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>${site}/</loc><changefreq>weekly</changefreq><priority>1.0</priority></url>
+  <url><loc>${site}/brand.png</loc><changefreq>monthly</changefreq><priority>0.3</priority></url>
+</urlset>
+`;
+  return new Response(body, {
+    headers: {
+      'Content-Type': 'application/xml; charset=utf-8',
+      'Cache-Control': 'public, max-age=3600',
+    },
+  });
+});
+
 app.get('/health', c => c.json({ ok: true, ts: new Date().toISOString() }));
 
 // 404 fallback
