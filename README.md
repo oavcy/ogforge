@@ -1,0 +1,217 @@
+# SnapOG
+
+Generate Open Graph images via API — Cloudflare Workers, cached on R2, sub-100ms on cache hit.
+
+**Live instance:** <https://snapog.aoadmin.workers.dev> · **License:** MIT
+
+> **Status: free demand probe. Nothing is for sale.**
+> There is no billing, no payment processor, and no paid plan. Signup issues one kind of
+> key — free, 100 rendered images per month. Every `https://<your-worker>.workers.dev`
+> below is a placeholder: substitute the Worker host you deployed to, or use
+> `http://127.0.0.1:8787` for local development.
+
+## Two ways to use it
+
+|  | Hosted instance | Self-host |
+|---|---|---|
+| URL | `https://snapog.aoadmin.workers.dev` | your own `*.workers.dev` |
+| Cost | free, 100 renders/month per key | your Cloudflare bill (free tier is usually enough) |
+| Watermark | yes | no — it's your deployment, delete the line |
+| Setup | 30 seconds, email → key | ~5 minutes, see [Self-Hosting](#self-hosting) |
+| Data | on our D1/R2 | entirely yours |
+
+If you are already on Cloudflare, **self-hosting is the better deal and we are not going
+to pretend otherwise** — that is why the whole thing is MIT and why the deploy path below
+is written to actually work rather than to nudge you back to the hosted one.
+
+## Self-Hosting
+
+Four commands from clone to a live OG endpoint on your own account:
+
+```bash
+git clone https://github.com/oavcy/snapog.git && cd snapog
+npm install
+
+# 1. Provision D1 + R2 on your account, then paste the printed database_id
+#    into wrangler.toml (top level AND [env.production]) — see the comment there.
+npx wrangler d1 create snapog-db
+npx wrangler r2 bucket create snapog-og-cache
+
+# 2. Apply schema to the remote database
+npm run db:remote
+
+# 3. Ship it
+npx wrangler deploy --env production
+```
+
+Then register a key at `https://<your-worker>.workers.dev/register` and you are done.
+No secrets are required: `AUTH_SECRET` is optional and only gates `POST /admin/upgrade`,
+which returns `503` while it is unset.
+
+**One gotcha, already handled for you:** Wrangler does *not* inherit `d1_databases`,
+`r2_buckets` or `vars` from the top level into a named environment. Deploying with
+`--env production` against a config that only declares bindings at the top level builds
+green, deploys green, and then 500s on every request with `env.DB` undefined. `wrangler.toml`
+here repeats the bindings in full under each environment for exactly that reason.
+
+## Quick Start
+
+```bash
+# Local: start the dev server (see "Local Development"), register a key at
+# http://127.0.0.1:8787/register, then:
+curl "http://127.0.0.1:8787/og?title=My+Blog+Post&domain=myblog.com&key=sk_YOUR_KEY" \
+  --output og.png && open og.png
+```
+
+## API
+
+```
+GET /og
+  ?title=Your Page Title     # required, max 120 chars
+  &key=sk_your_key           # required
+  &description=Subtitle      # optional, max 200 chars
+  &domain=yourdomain.com     # optional
+  &author=Jane Doe           # optional
+  &tag=Tutorial              # optional, shown as pill badge
+  &template=default          # default | blog | article
+  &theme=dark                # dark | light
+```
+
+Returns `image/png`, 1200×630.
+
+Headers:
+- `X-Cache: HIT|MISS` — whether served from R2 cache
+- `X-SnapOG-Tier: free|pro|business`
+- `X-SnapOG-Quota-Charged: true|false` — whether this request consumed quota
+
+## Quota model
+
+**Quota meters renders, not requests.** A cache MISS renders a new image and
+costs one unit. A cache HIT re-serves bytes already in R2 and costs nothing —
+it is logged to `usage_events` for analytics but never increments `usage_count`,
+and it is served even after the monthly limit is reached.
+
+This matters because an OG image URL lives in a customer's `<meta>` tag and gets
+re-fetched indefinitely by Twitter/Slack/LinkedIn unfurlers. Metering those
+re-fetches would mean the more a post is shared, the sooner every social preview
+on the customer's site goes blank.
+
+## HTML Integration
+
+Replace `<your-worker>.workers.dev` with your own deployment host.
+
+```html
+<meta property="og:image"
+      content="https://<your-worker>.workers.dev/og?title=YOUR_TITLE&key=YOUR_KEY" />
+<meta property="og:image:width"  content="1200" />
+<meta property="og:image:height" content="630" />
+<meta name="twitter:card"   content="summary_large_image" />
+<meta name="twitter:image"  content="https://<your-worker>.workers.dev/og?title=YOUR_TITLE&key=YOUR_KEY" />
+```
+
+## Limits
+
+Every key gets **100 rendered images per month**. Cache hits are free and
+unmetered, and already-cached images keep serving after the limit is reached.
+Rendered images carry a small "SnapOG" watermark. Each email address may hold at
+most **3 API keys** — extra keys are not a way to get extra renders.
+
+There is nothing to buy. A visitor who tells us 100/month wasn't enough is
+recorded in the `tier_interest` table via `POST /interest`; that table is the
+product of this deployment. An operator can raise a single key's allowance out
+of band with `POST /admin/upgrade` plus the `AUTH_SECRET` worker secret, which is
+unset by default (the endpoint then returns 503).
+
+## Local Development
+
+### Prerequisites
+- Node.js 18+, npm
+- Wrangler (`npm install -g wrangler`)
+- A Cloudflare account with Workers access
+
+### Setup
+
+```bash
+cd projects/snapog
+npm install
+
+# 1. Create D1 database
+wrangler d1 create snapog-db
+# Copy the returned database_id into wrangler.toml [d1_databases]
+
+# 2. Apply migrations locally
+npm run db:local
+
+# 3. Create R2 bucket (local R2 is simulated)
+# No setup needed for local dev — wrangler simulates R2
+
+# 4. Start dev server
+npm run dev
+```
+
+Open http://127.0.0.1:8787
+
+### Test
+
+```bash
+# Full regression suite — registers its own key, no setup needed
+BASE_URL=http://127.0.0.1:8787 bash sample/api-test.sh
+
+# Include the admin allowance-grant cases (AUTH_SECRET must match .dev.vars)
+BASE_URL=http://127.0.0.1:8787 ADMIN_SECRET=your-secret bash sample/api-test.sh
+
+# Or a single smoke check:
+API_KEY=sk_your_key bash sample/smoke-test.sh
+```
+
+### Typecheck
+
+```bash
+npm run typecheck
+```
+
+## Deployment
+
+The public host is a `*.workers.dev` subdomain — every URL in the app itself is
+built from the request host, so there is no domain to configure.
+
+```bash
+# 1. Create remote D1 database
+wrangler d1 create snapog-db
+# Update wrangler.toml with the database_id
+
+# 2. Apply migrations to remote
+npm run db:remote
+
+# 3. Create R2 bucket
+wrangler r2 bucket create snapog-og-cache
+
+# 4. Deploy
+wrangler deploy
+```
+
+## Tech Stack
+
+- [Cloudflare Workers](https://workers.cloudflare.com/) — edge compute
+- [Hono](https://hono.dev/) — HTTP framework
+- [workers-og](https://github.com/nicholasgasior/workers-og) — OG image generation (Satori-based)
+- [Cloudflare D1](https://developers.cloudflare.com/d1/) — SQLite for usage tracking
+- [Cloudflare R2](https://developers.cloudflare.com/r2/) — image cache storage
+
+## Project status, stated plainly
+
+SnapOG was built as a hosted product and then judged **commercially non-viable by its own
+team**: `workers-og` is a free MIT library, the people who need this are mostly already on
+a platform that can run it, and the $19–49 hosted tier is occupied by Placid, APITemplate.io
+and Bannerbear. We did not find a wedge. Publishing the source is the honest consequence of
+that finding, not a growth tactic — there is no upsell behind it because there is no payment
+processor behind it at all.
+
+So it is maintained, deployed, and free, and it is useful if either of these is true:
+
+- you want dynamic OG images without adding an image pipeline to your app, or
+- you want a working, non-toy reference for Workers + Hono + Satori + D1 + R2 —
+  including the quota model, the R2 cache path, and the environment-binding trap above.
+
+Issues and PRs are welcome. If you hit a limit that made you want a bigger allowance,
+say so in an issue — that signal is the entire reason this is public.

@@ -1,0 +1,53 @@
+name = "snapog"
+main = "src/index.ts"
+compatibility_date = "2024-11-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "snapog-db"
+database_id = "84f27d2b-5cf1-49e5-846f-b95b81159058"
+
+[[r2_buckets]]
+binding = "OG_CACHE"
+bucket_name = "snapog-og-cache"
+
+[vars]
+ENVIRONMENT = "development"
+# Set AUTH_SECRET via `wrangler secret put AUTH_SECRET` for dashboard cookie signing
+
+# Named environments do NOT inherit d1_databases / r2_buckets / vars from the
+# top level — Wrangler treats those keys as non-inheritable. Every environment
+# must therefore repeat its bindings in full, or it deploys with `env.DB` and
+# `env.OG_CACHE` undefined and every request 500s at runtime rather than at
+# build time.
+
+[env.staging]
+name = "snapog-staging"
+
+[[env.staging.d1_databases]]
+binding = "DB"
+database_name = "snapog-db"
+database_id = "84f27d2b-5cf1-49e5-846f-b95b81159058"
+
+[[env.staging.r2_buckets]]
+binding = "OG_CACHE"
+bucket_name = "snapog-og-cache"
+
+[env.staging.vars]
+ENVIRONMENT = "staging"
+
+[env.production]
+name = "snapog"
+
+[[env.production.d1_databases]]
+binding = "DB"
+database_name = "snapog-db"
+database_id = "84f27d2b-5cf1-49e5-846f-b95b81159058"
+
+[[env.production.r2_buckets]]
+binding = "OG_CACHE"
+bucket_name = "snapog-og-cache"
+
+[env.production.vars]
+ENVIRONMENT = "production"
