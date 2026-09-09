@@ -374,10 +374,81 @@ app.get('/postmortem/hits', async c => {
   }
 });
 
+// ── Bearer credentials (RFC 9110 §15.5.2, §11.6.1 · RFC 6750) ─────────────────
+// RFC 9110 says it twice, in two sections, as a MUST: "The server generating a
+// 401 response MUST send a WWW-Authenticate header field ... containing at
+// least one challenge applicable to the target resource." For 55 cycles this
+// endpoint sent bare 401s. The header is not decoration — it is the only thing
+// in the response that tells a client HOW to authenticate.
+//
+// A challenge naming a scheme the server ignores would be a prop: a header
+// advertising a capability that does not exist. Before this change,
+// `Authorization: Bearer <key>` was MEASURED to be ignored — it returned
+// "key parameter is required", the no-credentials error. So the challenge and
+// the reader of that challenge ship together, or neither ships.
+const AUTH_REALM = 'ogforge';
+
+// RFC 6750 §3.1: "If the request lacks any authentication information ... the
+// resource server SHOULD NOT include an error code or other error
+// information." Only a credential that was SUPPLIED AND REJECTED earns one.
+// The description is a fixed literal — never interpolate the submitted key,
+// which would reflect an attacker's bytes into a quoted header value.
+function bearerChallenge(invalidToken = false): string {
+  return invalidToken
+    ? `Bearer realm="${AUTH_REALM}", error="invalid_token", ` +
+        `error_description="The API key is expired, revoked, or not valid"`
+    : `Bearer realm="${AUTH_REALM}"`;
+}
+
+// The 401 bodies now genuinely differ by request header — "key parameter is
+// required" with no credentials, "Invalid API key" with a rejected Bearer — so
+// they Vary for the same reason the images do. Two payoffs beyond correctness:
+// a shared cache cannot pin one 401 over the other, and unlike the 200s this
+// response is reachable WITHOUT an API key, which is the only way the gate can
+// prove anonymously that `Vary` survives the platform at all.
+function challengeHeaders(invalidToken = false): Record<string, string> {
+  return {
+    'WWW-Authenticate': bearerChallenge(invalidToken),
+    Vary: 'Authorization',
+  };
+}
+
+// ── Why both /og 200s carry `Vary: Authorization` ─────────────────────────────
+// RFC 9111 §3.5: a shared cache MUST NOT reuse a response to a request bearing
+// an `Authorization` header field UNLESS the response carries a directive that
+// allows it — and it names exactly three: `must-revalidate`, `public`, and
+// `s-maxage`. The /og image response carries `public, max-age=86400,
+// s-maxage=604800`: TWO of the three. The prohibition that would have saved us
+// is lifted by our own header.
+//
+// So the moment /og began reading `Authorization`, two different requests to
+// the SAME URL — `/og?title=x` with a Bearer header, and without — became
+// cache-confusable, and a shared cache would be within spec to serve one
+// account's render to an anonymous requester for a week. `Vary` (RFC 9111 §4.1)
+// is what re-separates them. Fixing the RFC 9110 defect opened an RFC 9111 one;
+// both halves ship in the same commit, because half of this is worse than none.
+//
+// Cost to existing clients: zero. They authenticate with `?key=` and send no
+// `Authorization` header at all, so they all match on the same absent value and
+// keep sharing one cache entry.
+//
+// `?key=` remains the documented interface: every key we have issued, the
+// README and the landing page all use it, and removing it would break them.
+// RFC 6750 §2.3 rates query-parameter delivery "NOT RECOMMENDED", so we do NOT
+// adopt its `access_token` alias — adding a second discouraged spelling buys
+// nothing. We add the header form §2.1 does recommend, beside what we serve.
+function readCredential(c: Context<{ Bindings: Env }>): string | null {
+  const fromQuery = c.req.query('key');
+  if (fromQuery) return fromQuery;
+  const header = (c.req.header('Authorization') ?? '').trim();
+  const match = /^Bearer[ \t]+(\S+)$/i.exec(header);
+  return match ? match[1] : null;
+}
+
 // ── OG image generation ────────────────────────────────────────────────────────
 app.get('/og', async c => {
   const q = c.req.query();
-  const rawKey = q['key'] ?? null;
+  const rawKey = readCredential(c);
 
   // Validate required param
   const title = (q['title'] ?? '').trim().slice(0, 120);
@@ -387,11 +458,15 @@ app.get('/og', async c => {
 
   // Resolve API key (required)
   if (!rawKey) {
-    return c.json({ error: 'key parameter is required. Get a free key at /register' }, 401);
+    return c.json(
+      { error: 'key parameter is required. Get a free key at /register' },
+      401,
+      challengeHeaders()
+    );
   }
   let apiKey = await resolveApiKey(c.env.DB, rawKey);
   if (!apiKey) {
-    return c.json({ error: 'Invalid API key' }, 401);
+    return c.json({ error: 'Invalid API key' }, 401, challengeHeaders(true));
   }
 
   // Reset usage if month rolled
@@ -428,6 +503,9 @@ app.get('/og', async c => {
       headers: {
         'Content-Type': 'image/png',
         'Cache-Control': 'public, max-age=86400, s-maxage=604800',
+        // See the Vary note above readCredential(). Required from the moment
+        // this route began reading `Authorization`, not before.
+        Vary: 'Authorization',
         'X-Cache': 'HIT',
         'X-OGForge-Tier': apiKey.tier,
         'X-OGForge-Quota-Charged': 'false',
@@ -471,6 +549,10 @@ app.get('/og', async c => {
     headers: {
       'Content-Type': 'image/png',
       'Cache-Control': 'public, max-age=86400, s-maxage=604800',
+      // See the Vary note above readCredential(). Both /og exits carry it; a
+      // cache that saw only the HIT path would still be free to confuse the
+      // MISS one.
+      Vary: 'Authorization',
       'X-Cache': 'MISS',
       'X-OGForge-Tier': apiKey.tier,
       'X-OGForge-Quota-Charged': 'true',

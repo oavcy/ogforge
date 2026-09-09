@@ -320,6 +320,79 @@ sitemap_field_defects() { # sitemap-body-file today-YYYY-MM-DD
   return 0
 }
 
+# ------------------------------------- 401 challenge discipline (#55)
+# #54 asked "who READS this output, and what have they published about how they
+# read it?" and found a sitemap nobody read. #55 asked it of /og's ERROR
+# responses, where the consumer is every HTTP client and cache on the internet
+# and the published rule is normative. Fetched this cycle, not recalled:
+#
+#   "The server generating a 401 response MUST send a WWW-Authenticate header
+#    field (Section 11.6.1) containing at least one challenge applicable to the
+#    target resource."          -- RFC 9110 §15.5.2, repeated verbatim in §11.6.1
+#
+#   "All challenges defined by this specification MUST use the auth-scheme
+#    value 'Bearer'. ... The 'realm' attribute MUST NOT appear more than once."
+#   "If the request lacks any authentication information ... the resource server
+#    SHOULD NOT include an error code or other error information."
+#   "invalid_token: The access token provided is expired, revoked, malformed, or
+#    invalid ... SHOULD respond with the HTTP 401 status code."
+#                                                    -- RFC 6750 §3, §3.1
+#
+# /og sent bare 401s for 55 cycles. Note what was NOT wrong: the status code was
+# right, the JSON body was clear and actionable, and no client ever complained —
+# there are no clients. A defect against a MUST does not need a victim to exist.
+#
+# `Vary` is checked in the same predicate because the two are one change. See the
+# note above readCredential() in src/index.ts: reading `Authorization` while
+# serving `Cache-Control: public, s-maxage=604800` is exactly the shape RFC 9111
+# §3.5 permits a shared cache to collapse. Splitting these into two checks would
+# let a future cycle satisfy one and drop the other.
+auth_challenge_defects() { # headers-file  expect(none|invalid)
+  _af="$1"; _aexp="$2"
+  # An unfetched response makes every verdict below vacuous (#41). Never let an
+  # empty input read as a clean result.
+  [ -s "$_af" ] || { echo "UNREADABLE: no response headers captured"; return 0; }
+
+  _ast=$(grep -i '^HTTP/' "$_af" 2>/dev/null | tail -1 | tr -d '\r' | awk '{print $2}')
+  [ -n "$_ast" ] || { echo "UNREADABLE: no status line in captured headers"; return 0; }
+  if [ "$_ast" != "401" ]; then
+    echo "STATUS: got ${_ast}, expected 401 — a rejected credential is 401 (RFC 6750 §3.1)"
+    return 0
+  fi
+
+  _awa=$(grep -i '^WWW-Authenticate:' "$_af" 2>/dev/null | head -1 | tr -d '\r' \
+         | sed -e 's/^[Ww][Ww][Ww]-[Aa]uthenticate:[[:space:]]*//')
+  if [ -z "$_awa" ]; then
+    echo "NO-CHALLENGE: 401 without WWW-Authenticate — RFC 9110 §15.5.2 makes this a MUST"
+  else
+    case "$_awa" in
+      Bearer\ *|Bearer) ;;
+      *) echo "SCHEME: challenge is '${_awa%% *}', not Bearer (RFC 6750 §3 MUST)" ;;
+    esac
+    _arn=$(printf '%s' "$_awa" | grep -o 'realm=' | wc -l | tr -d ' ')
+    [ "$_arn" -le 1 ] || \
+      echo "REALM: 'realm' appears ${_arn} times — RFC 6750 §3 says MUST NOT appear more than once"
+    case "$_aexp" in
+      none)
+        # No credentials were sent, so there is nothing to report an error ABOUT.
+        printf '%s' "$_awa" | grep -q 'error=' && \
+          echo "OVERSHARE: challenge carries error= for a request that sent no credentials (RFC 6750 §3.1 SHOULD NOT)"
+        ;;
+      invalid)
+        # This row is the anti-prop assertion: it can only pass if the server
+        # actually READ the credential it is now advertising it accepts.
+        printf '%s' "$_awa" | grep -q 'error="invalid_token"' || \
+          echo "NO-ERROR-CODE: a rejected credential must say error=\"invalid_token\" (RFC 6750 §3.1)"
+        ;;
+    esac
+  fi
+
+  _av=$(grep -i '^Vary:' "$_af" 2>/dev/null | tr -d '\r' | sed -e 's/^[Vv]ary:[[:space:]]*//')
+  printf '%s' "$_av" | grep -qi 'authorization' || \
+    echo "NO-VARY: response reads Authorization but omits 'Vary: Authorization' (RFC 9111 §3.5, §4.1)"
+  return 0
+}
+
 # ------------------------------------------------------------------- URL helpers
 # Normalize a raw attribute value to an absolute URL on BASE, or emit nothing if
 # the reference is out of scope (external host, anchor, mailto:, data:, ...).
@@ -1258,6 +1331,58 @@ self_test() {
     fi
   done
 
+  # 16c. 401 CHALLENGE DISCIPLINE (#55). Nine fixtures through the same predicate
+  #      the live check uses. The first is the response /og actually served until
+  #      this cycle — captured, not imagined — so if this gate could not go red on
+  #      it, it would be certifying its own fix. Two green controls (one per
+  #      expectation) are here because a check that flags every 401 is worth
+  #      nothing.
+  st_chdir="$WORKDIR/selftest-challenges"; mkdir -p "$st_chdir"
+
+  # The pre-#55 response, verbatim: correct status, clear body, no challenge.
+  printf 'HTTP/2 401 \r\ncontent-type: application/json\r\n\r\n' > "$st_chdir/pre55.txt"
+  printf 'HTTP/2 401 \r\nwww-authenticate: Bearer realm="ogforge"\r\nvary: Authorization\r\ncontent-type: application/json\r\n\r\n' \
+    > "$st_chdir/good-none.txt"
+  printf 'HTTP/2 401 \r\nwww-authenticate: Bearer realm="ogforge", error="invalid_token", error_description="x"\r\nvary: Authorization\r\n\r\n' \
+    > "$st_chdir/good-invalid.txt"
+  printf 'HTTP/2 401 \r\nwww-authenticate: Basic realm="ogforge"\r\nvary: Authorization\r\n\r\n' \
+    > "$st_chdir/wrong-scheme.txt"
+  printf 'HTTP/2 401 \r\nwww-authenticate: Bearer realm="a", realm="b"\r\nvary: Authorization\r\n\r\n' \
+    > "$st_chdir/double-realm.txt"
+  printf 'HTTP/2 401 \r\nwww-authenticate: Bearer realm="ogforge", error="invalid_token"\r\nvary: Authorization\r\n\r\n' \
+    > "$st_chdir/overshare.txt"
+  printf 'HTTP/2 401 \r\nwww-authenticate: Bearer realm="ogforge"\r\nvary: Accept-Encoding\r\n\r\n' \
+    > "$st_chdir/no-vary.txt"
+  printf 'HTTP/2 200 \r\ncontent-type: image/png\r\n\r\n' > "$st_chdir/not-401.txt"
+  : > "$st_chdir/unfetchable.txt"
+
+  for st_case in \
+    "2|pre55.txt|none|the 401 /og served until #55 — no challenge, no Vary" \
+    "0|good-none.txt|none|no credentials: bare Bearer challenge, must be clean" \
+    "0|good-invalid.txt|invalid|rejected credential: error=invalid_token, must be clean" \
+    "1|wrong-scheme.txt|none|a Basic challenge on a Bearer resource is rejected" \
+    "1|double-realm.txt|none|realm twice is rejected (RFC 6750 §3 MUST NOT)" \
+    "1|overshare.txt|none|error= on a request that sent no credentials is rejected" \
+    "1|no-vary.txt|none|a Vary that omits Authorization is rejected" \
+    "1|not-401.txt|invalid|a non-401 on the rejected-credential probe is rejected" \
+    "1|unfetchable.txt|none|an uncaptured response reports UNREADABLE, never a pass"
+  do
+    st_want=${st_case%%|*}; st_rest=${st_case#*|}
+    st_file=${st_rest%%|*}; st_rest=${st_rest#*|}
+    st_exp=${st_rest%%|*}; st_desc=${st_rest#*|}
+    # Count on its own line, then head -1: `grep -c .` prints 0 AND exits 1 on no
+    # match, so `$(... | grep -c .)` inside a pipeline is fine but the `|| echo 0`
+    # form is not. This is the bug #54's own new check shipped with.
+    st_got=$(auth_challenge_defects "$st_chdir/$st_file" "$st_exp" | grep -c . | head -1)
+    if [ "$st_got" = "$st_want" ]; then
+      row "selftest" "auth" "OK" "$st_got" "challenge" "$st_desc"
+    else
+      row "selftest" "auth" "BAD" "$st_got" "challenge" \
+          "$st_desc — got ${st_got} defect(s), wanted ${st_want}"
+      st_fail=1
+    fi
+  done
+
   # 17. THE EXIT CODE ITSELF. Every assertion above tests a pure function; none of
   #     them would notice if the exit-code block were deleted. That block is the
   #     one thing this design cites as making the external class falsifiable
@@ -1993,6 +2118,56 @@ if [ "$MODE" != "docs-only" ]; then
       printf '%s\t%s\t%s\t%s\n' "sitemap.xml" "sitemap" "${BASE}/sitemap.xml" "$sm_d" >> "$FAILLOG"
     done < "$sm_defects"
   fi
+fi
+
+# ---- live 401 challenge discipline (#55) -------------------------------------
+# Two probes, anonymous, against the real /og. Falsifiable by measurement: both
+# were RED before #55's deploy (bare 401, no challenge, no Vary).
+#
+# The second probe is the load-bearing one. It sends the credential in the
+# `Authorization` header the challenge advertises; before #55 the server ignored
+# that header entirely and answered with the no-credentials error, so a passing
+# row here is the proof that the challenge is not a prop. A gate that only
+# checked the header's PRESENCE would go green on a server that advertises
+# Bearer and reads nothing.
+if [ "$MODE" != "docs-only" ]; then
+  echo
+  echo "401 CHALLENGE DISCIPLINE   (RFC 9110 §15.5.2 MUST · RFC 6750 §3.1 · RFC 9111 §3.5)"
+  hr
+  for au_case in \
+    "none|/og?title=probe||no credentials sent" \
+    "invalid|/og?title=probe|Authorization: Bearer ogf_definitely_not_a_real_key|rejected Bearer credential"
+  do
+    au_exp=${au_case%%|*}; au_rest=${au_case#*|}
+    au_path=${au_rest%%|*}; au_rest=${au_rest#*|}
+    au_hdr=${au_rest%%|*}; au_desc=${au_rest#*|}
+    au_file="$WORKDIR/auth-${au_exp}.hdr"
+    if [ -n "$au_hdr" ]; then
+      curl -sS --compressed --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" \
+           -A "$UA" -H "$au_hdr" -D "$au_file" -o /dev/null "${BASE}${au_path}" 2>/dev/null || :
+    else
+      curl -sS --compressed --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" \
+           -A "$UA" -D "$au_file" -o /dev/null "${BASE}${au_path}" 2>/dev/null || :
+    fi
+    au_defects="$WORKDIR/auth-${au_exp}-defects.txt"
+    auth_challenge_defects "$au_file" "$au_exp" > "$au_defects"
+    # Count read on its own, then head -1 (see #54's bug, noted in the self-test).
+    au_n=$(grep -c . "$au_defects" 2>/dev/null | head -1)
+    au_n=${au_n:-0}
+    TOTAL=$((TOTAL + 1))
+    if [ "$au_n" -eq 0 ]; then
+      PASSED=$((PASSED + 1))
+      row "/og" "auth" "PASS" "-" "challenge" "${au_desc} — conformant 401, ${au_n} defect(s)"
+    else
+      FAILED=$((FAILED + 1))
+      row "/og" "auth" "FAIL" "-" "challenge" "${au_desc} — ${au_n} defect(s)"
+      while IFS= read -r au_d; do
+        [ -n "$au_d" ] || continue
+        row "" "auth" "" "" "" "  $au_d"
+        printf '%s\t%s\t%s\t%s\n' "/og" "auth" "${BASE}${au_path}" "$au_d" >> "$FAILLOG"
+      done < "$au_defects"
+    fi
+  done
 fi
 
 if [ "$RUN_DOCS" -eq 1 ]; then
