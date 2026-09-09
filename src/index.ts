@@ -94,12 +94,33 @@ function origin(requestUrl: string): string {
   return url.origin;
 }
 
-function htmlResponse(html: string, status = 200): Response {
+function htmlResponse(
+  html: string,
+  status = 200,
+  extraHeaders: Record<string, string> = {}
+): Response {
   return new Response(html, {
     status,
-    headers: { 'Content-Type': 'text/html; charset=utf-8' },
+    headers: { 'Content-Type': 'text/html; charset=utf-8', ...extraHeaders },
   });
 }
+
+// Cycle #53. A `<meta name="robots">` tag only works if the crawler is allowed to
+// FETCH the page and read it. Google's own documentation, fetched this cycle from
+// developers.google.com/search/docs/crawling-indexing/block-indexing:
+//
+//   "Important: For the noindex rule to be effective, the page or resource must
+//    not be blocked by a robots.txt file, and it has to be otherwise accessible
+//    to the crawler."
+//   "If the page is blocked by a robots.txt file or the crawler can't access the
+//    page, the crawler will never see the noindex rule, and the page can still
+//    appear in search results, for example if other pages link to it."
+//
+// So `Disallow: /dashboard` did not reinforce PRIVATE_HEAD, it CANCELLED it — and
+// two comments in pages.ts said the opposite. Sent as a header as well as a meta
+// tag because a header is the only mechanism available to a JSON endpoint, and
+// because it survives a page whose head we forget to mark.
+const NOINDEX_HEADER = { 'X-Robots-Tag': 'noindex, nofollow' };
 
 // Validate an API key from request and return the DB row, or null
 async function resolveApiKey(
@@ -305,6 +326,10 @@ app.get(`${POSTMORTEM_PATH}/`, c => c.redirect(POSTMORTEM_PATH, 301));
 // traffic, and evidence only we can read is worth less. Aggregate rows only —
 // referrer host and a count. No paths, no URLs, no visitor data of any kind.
 app.get('/postmortem/hits', async c => {
+  // JSON cannot carry a <meta> tag, so the header is not belt-and-braces here —
+  // it is the only mechanism this endpoint has. It replaces `Disallow:
+  // /postmortem/hits`, which kept the crawler from reading any directive at all.
+  c.header('X-Robots-Tag', 'noindex, nofollow');
   try {
     const { results } = await c.env.DB.prepare(
       `SELECT ref_host, COUNT(*) AS hits, MIN(day) AS first_day, MAX(day) AS last_day
@@ -811,13 +836,15 @@ app.get('/dashboard', async c => {
     // register page's canonical and og:url name /register while the request URL is
     // /dashboard — see the note on registerPage.
     return htmlResponse(
-      registerPage(origin(c.req.url), 'Enter your API key or create a new one below', 'other')
+      registerPage(origin(c.req.url), 'Enter your API key or create a new one below', 'other'),
+      200,
+      NOINDEX_HEADER
     );
   }
 
   const apiKey = await resolveApiKey(c.env.DB, rawKey);
   if (!apiKey) {
-    return htmlResponse(errorPage(404, 'API key not found'), 404);
+    return htmlResponse(errorPage(404, 'API key not found'), 404, NOINDEX_HEADER);
   }
 
   const refreshed = await maybeResetUsage(c.env.DB, apiKey);
@@ -832,7 +859,9 @@ app.get('/dashboard', async c => {
     .first<{ cnt: number }>();
 
   return htmlResponse(
-    dashboardPage(origin(c.req.url), refreshed, recent?.cnt ?? 0)
+    dashboardPage(origin(c.req.url), refreshed, recent?.cnt ?? 0),
+    200,
+    NOINDEX_HEADER
   );
 });
 
@@ -868,22 +897,29 @@ app.get('/favicon.svg', _c =>
 // of what <link rel="icon"> says, so that path must not 404.
 app.get('/favicon.ico', c => c.redirect('/favicon.svg', 301));
 
-// Ours, with directives that actually exist. Disallowing /dashboard and
-// Keep key-scoped and admin paths out of indexes. /dashboard genuinely needs a
-// key, so it is worthless as a search result. /register is NOT in that category
-// and used to be lumped in with it (cycle #21): it is a plain 200 HTML page and
-// the only conversion point of a free product, so "free og image api key" ought
-// to be able to land there. "Form-only" is not the same thing as "authenticated".
+// Ours, with directives that actually exist. /register is NOT key-scoped and used
+// to be lumped in with /dashboard (cycle #21): it is a plain 200 HTML page and the
+// only conversion point of a free product, so "free og image api key" ought to be
+// able to land there. "Form-only" is not the same thing as "authenticated".
+//
+// Cycle #53: `Disallow: /dashboard` and `Disallow: /postmortem/hits` are GONE, and
+// their removal is the fix, not a relaxation. Both paths want to stay out of search
+// results, and both now say so where a crawler can actually hear it — see
+// NOINDEX_HEADER above for Google's published rule. Disallow and noindex are not
+// two locks on one door: Disallow stops the fetch, so the noindex behind it is
+// never read, and the URL can still be listed from an inbound link. Exactly two
+// mechanisms are in play now and they compose instead of cancelling.
+//
+// `Disallow: /admin/` STAYS. Verified this cycle: `/admin/` and `/admin/upgrade`
+// both answer 404 to GET (the only handler is a POST), so there is no page there
+// emitting a directive for this line to suppress. A Disallow with nothing behind
+// it cancels nothing.
 app.get('/robots.txt', c => {
   const site = origin(c.req.url);
   const body = [
     'User-agent: *',
     'Allow: /',
-    'Disallow: /dashboard',
     'Disallow: /admin/',
-    // The postmortem page itself is very much indexable; only the JSON
-    // instrument beneath it is not a search result anyone wants.
-    'Disallow: /postmortem/hits',
     '',
     `Sitemap: ${site}/sitemap.xml`,
     '',

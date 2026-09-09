@@ -430,8 +430,15 @@ function socialHead(
 
 // ogp.me: "The four required properties for every page are" og:title, og:type,
 // og:image, og:url. /dashboard, the key-created page and the error pages are not
-// graph objects — /dashboard is already Disallow-ed in robots.txt and the
-// key-created page renders a live `sk_…` in its body. The standards-correct move
+// graph objects, and the key-created page renders a live `sk_…` in its body.
+//
+// This comment used to read "/dashboard is already Disallow-ed in robots.txt" as
+// if that RE-ENFORCED the tag below. Cycle #53 measured the opposite: a Disallow
+// stops the crawler from fetching the page, so it never reads this tag. The
+// Disallow is gone and /dashboard now also sends `X-Robots-Tag: noindex, nofollow`
+// (see NOINDEX_HEADER in index.ts). Do not re-add a Disallow for any path whose
+// response carries a directive — you would be hiding the directive, not doubling it.
+// The standards-correct move
 // for a page that should not be shared is to SAY so, not to omit the properties
 // and leave a crawler to guess. Omission is what those pages did before #50, and
 // it is indistinguishable from the bug we just fixed on /register.
@@ -785,8 +792,9 @@ const REGISTER_OG_TITLE = 'Start generating — free OG images';
 // Wrong metadata is worse than none: absent tags make a crawler fall back to the
 // request URL, while a canonical naming another page actively asks it to drop this
 // one. The head must describe the URL that served it, so the non-canonical route
-// gets PRIVATE_HEAD — which is also what robots.txt already says about /dashboard
-// (`Disallow: /dashboard`) and what dashboardPage() itself already emits.
+// gets PRIVATE_HEAD — which is also what dashboardPage() itself already emits.
+// (This line used to cite `Disallow: /dashboard` as agreeing with PRIVATE_HEAD.
+// It did the reverse; removed in #53.)
 export function registerPage(
   origin: string,
   error?: string,

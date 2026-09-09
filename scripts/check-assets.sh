@@ -216,6 +216,46 @@ canonical_mismatch() { # body-file effective-url
   return 0
 }
 
+# ------------------------------------------------- noindex reachability (#53)
+# Cycle #50 put `<meta name="robots" content="noindex, nofollow">` on /dashboard.
+# Cycle #53 fetched Google's own documentation and found the tag had never been
+# readable, because our robots.txt also said `Disallow: /dashboard`:
+#
+#   "Important: For the noindex rule to be effective, the page or resource must
+#    not be blocked by a robots.txt file, and it has to be otherwise accessible
+#    to the crawler."   -- developers.google.com/search/docs/crawling-indexing/
+#                          block-indexing (fetched 2026-09-10, HTTP 200)
+#
+# Disallow and noindex are not two locks on one door. Disallow stops the FETCH,
+# so the noindex behind it is never read and the URL can still be listed from an
+# inbound link. Every check we owned passed while the two cancelled each other:
+# the page really did carry the tag, and robots.txt really did carry the rule.
+#
+# Returns 0 = this path IS blocked by a Disallow rule, 1 = it is reachable.
+robots_disallows() { # robots-body-file path
+  _rf="$1"; _rp="$2"
+  [ -s "$_rf" ] || return 1
+  # Values only, whitespace trimmed. An empty `Disallow:` means "allow all" per
+  # RFC 9309 and must not be read as blocking everything.
+  grep -iE '^[[:space:]]*Disallow:' "$_rf" 2>/dev/null \
+    | sed -e 's/^[^:]*:[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/\r$//' \
+    | while IFS= read -r _rule; do
+        [ -n "$_rule" ] || continue
+        case "$_rp" in "$_rule"*) echo BLOCKED ;; esac
+      done | grep -q BLOCKED
+}
+
+# What directive does this response actually carry? Header OR meta tag: a JSON
+# endpoint cannot carry a meta tag, so a check that only reads HTML would report
+# "no directive" for the exact case where the header is the only mechanism.
+response_says_noindex() { # header-file body-file
+  grep -iE '^x-robots-tag:.*noindex' "$1" >/dev/null 2>&1 && return 0
+  [ -s "$2" ] || return 1
+  tr -d '\n' < "$2" \
+    | grep -oiE '<meta[^>]+name="robots"[^>]*>' 2>/dev/null \
+    | grep -qi 'noindex'
+}
+
 # ------------------------------------------------------------------- URL helpers
 # Normalize a raw attribute value to an absolute URL on BASE, or emit nothing if
 # the reference is out of scope (external host, anchor, mailto:, data:, ...).
@@ -597,6 +637,66 @@ self_test() {
     st_fail=1
   else
     row "selftest" "head" "OK" "-" "canonical" "trailing slash tolerated -> not a mismatch"
+  fi
+
+  # ---- noindex reachability (added #53; the class this gate shipped for 3 cycles) ----
+  # Both halves matter. Always-green would never have caught #53's defect; always-red
+  # would flag `Disallow: /admin/`, which is correct precisely because nothing is there.
+  st_rb="$WORKDIR/selftest-robots.txt"
+  st_hd="$WORKDIR/selftest-headers.txt"
+  st_bd="$WORKDIR/selftest-noindex.html"
+  printf '%s\n' 'User-agent: *' 'Allow: /' 'Disallow: /dashboard' 'Disallow: /admin/' > "$st_rb"
+  if robots_disallows "$st_rb" "/dashboard"; then
+    row "selftest" "robots" "OK" "-" "noindex-reach" "exact Disallow -> correctly detected (the #53 defect)"
+  else
+    row "selftest" "robots" "BAD" "-" "noindex-reach" "exact Disallow NOT detected — this check is decorative"
+    st_fail=1
+  fi
+  if robots_disallows "$st_rb" "/admin/upgrade"; then
+    row "selftest" "robots" "OK" "-" "noindex-reach" "prefix Disallow -> correctly detected"
+  else
+    row "selftest" "robots" "BAD" "-" "noindex-reach" "prefix rule did not match a path beneath it"
+    st_fail=1
+  fi
+  if robots_disallows "$st_rb" "/register"; then
+    row "selftest" "robots" "BAD" "-" "noindex-reach" "unblocked path flagged — check is always-red"
+    st_fail=1
+  else
+    row "selftest" "robots" "OK" "-" "noindex-reach" "unblocked path -> correctly passed (not always-red)"
+  fi
+  # RFC 9309: an empty Disallow value allows everything. Read as a blanket block it
+  # would make every page on the site red forever.
+  printf '%s\n' 'User-agent: *' 'Disallow:' > "$st_rb"
+  if robots_disallows "$st_rb" "/anything"; then
+    row "selftest" "robots" "BAD" "-" "noindex-reach" "empty 'Disallow:' read as blocking — RFC 9309 says it allows all"
+    st_fail=1
+  else
+    row "selftest" "robots" "OK" "-" "noindex-reach" "empty 'Disallow:' -> correctly not a block"
+  fi
+  # And the directive reader: header-only is the JSON case, meta-only the HTML case.
+  printf '%s\n' 'HTTP/2 200' 'x-robots-tag: noindex, nofollow' > "$st_hd"
+  : > "$st_bd"
+  if response_says_noindex "$st_hd" "$st_bd"; then
+    row "selftest" "robots" "OK" "-" "noindex-reach" "X-Robots-Tag with empty body -> detected (the JSON case)"
+  else
+    row "selftest" "robots" "BAD" "-" "noindex-reach" "header-only noindex missed — JSON endpoints unverifiable"
+    st_fail=1
+  fi
+  printf '%s\n' 'HTTP/2 200' 'content-type: text/html' > "$st_hd"
+  printf '%s' '<html><head><meta name="robots"
+     content="noindex, nofollow" /></head><body>x</body></html>' > "$st_bd"
+  if response_says_noindex "$st_hd" "$st_bd"; then
+    row "selftest" "robots" "OK" "-" "noindex-reach" "meta noindex across a newline -> detected"
+  else
+    row "selftest" "robots" "BAD" "-" "noindex-reach" "meta noindex missed when the tag wraps a line"
+    st_fail=1
+  fi
+  printf '%s' '<html><head><meta name="robots" content="index, follow" /></head><body>x</body></html>' > "$st_bd"
+  if response_says_noindex "$st_hd" "$st_bd"; then
+    row "selftest" "robots" "BAD" "-" "noindex-reach" "'index, follow' read as noindex — check is always-red"
+    st_fail=1
+  else
+    row "selftest" "robots" "OK" "-" "noindex-reach" "'index, follow' -> correctly not noindex"
   fi
 
   st_html="$WORKDIR/selftest-brand.html"
@@ -1685,6 +1785,53 @@ if [ "$MODE" != "docs-only" ]; then
     [ -n "${p:-}" ] || continue
     scan_page "$p" "$exp"
   done < "$WORKDIR/pages.txt"
+fi
+
+# ---- live noindex reachability (#53) -----------------------------------------
+# For every path that asks not to be indexed, robots.txt must let a crawler in to
+# hear it. Runs against the live site, anonymously, like everything else here.
+# Falsifiable: RED before #53's deploy (both paths were Disallow-ed while
+# carrying/needing a noindex), GREEN after.
+if [ "$MODE" != "docs-only" ]; then
+  echo
+  echo "NOINDEX REACHABILITY   (a Disallow-ed page never gets to say noindex)"
+  hr
+  nr_robots="$WORKDIR/live-robots.txt"
+  curl -sS -L --compressed --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" \
+       -A "$UA" -o "$nr_robots" "${BASE}/robots.txt" 2>/dev/null || :
+  if [ ! -s "$nr_robots" ]; then
+    # An unreadable robots.txt makes every verdict below vacuous, so say so
+    # instead of printing a row of passes. (#41: never let an empty input read
+    # as a clean result.)
+    TOTAL=$((TOTAL + 1)); FAILED=$((FAILED + 1))
+    row "robots.txt" "robots" "FAIL" "-" "noindex-reach" "${BASE}/robots.txt" \
+        "robots.txt empty or unfetchable — reachability of every noindex is UNKNOWN, not OK"
+    printf '%s\t%s\t%s\t%s\n' "robots.txt" "robots" "${BASE}/robots.txt" \
+        "robots.txt could not be read; noindex reachability unverifiable" >> "$FAILLOG"
+  else
+    for nr_p in /dashboard /postmortem/hits /register /; do
+      nr_h="$WORKDIR/nr-h$(printf '%s' "$nr_p" | tr -c 'a-zA-Z0-9' '_').txt"
+      nr_b="$WORKDIR/nr-b$(printf '%s' "$nr_p" | tr -c 'a-zA-Z0-9' '_').out"
+      curl -sS -L --compressed --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" \
+           -A "$UA" -D "$nr_h" -o "$nr_b" "${BASE}${nr_p}" 2>/dev/null || :
+      nr_lbl=$(printf '%s' "$nr_p" | cut -c1-14)
+      if response_says_noindex "$nr_h" "$nr_b"; then
+        TOTAL=$((TOTAL + 1))
+        if robots_disallows "$nr_robots" "$nr_p"; then
+          FAILED=$((FAILED + 1))
+          row "$nr_lbl" "robots" "FAIL" "-" "noindex-reach" "noindex + Disallow" \
+              "asks noindex but robots.txt blocks the fetch, so no crawler ever reads it"
+          printf '%s\t%s\t%s\t%s\n' "$nr_lbl" "robots" "${BASE}${nr_p}" \
+              "noindex directive is unreachable behind a Disallow rule" >> "$FAILLOG"
+        else
+          PASSED=$((PASSED + 1))
+          row "$nr_lbl" "robots" "PASS" "-" "noindex-reach" "noindex, crawlable"
+        fi
+      else
+        row "$nr_lbl" "robots" "-" "-" "noindex-reach" "no noindex directive (indexable — nothing to reach)"
+      fi
+    done
+  fi
 fi
 
 if [ "$RUN_DOCS" -eq 1 ]; then
