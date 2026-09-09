@@ -376,6 +376,17 @@ check_and_report() {
 ext_severity() {
   case "$1" in
     5*|ERR|000) echo "NOTE" ;;
+    # 429/408 are 4xx by number and NOTE by meaning. Throttling and a server-side
+    # request timeout say "ask again later", not "the thing you cited is gone" —
+    # the exact distinction this function's own header draws. Left in the WARN
+    # catch-all, they made the evidence path NON-DETERMINISTIC and flaky toward
+    # FAIL: cycle #25's first gate run went red on a 429 from a host that served
+    # the identical URL 200 minutes later. That direction of flake is the
+    # dangerous one. A gate that fails for reasons the repo cannot fix is a gate
+    # someone switches off, and the switch was sitting right there in
+    # --external-lenient, which would have disarmed the real WARN check that #24
+    # D3 deliberately armed. Fixing the classifier keeps the arming intact.
+    429|408)    echo "NOTE" ;;
     *)          echo "WARN" ;;
   esac
 }
@@ -679,6 +690,25 @@ self_test() {
     row "selftest" "ext" "OK" "-" "severity" "5xx/ERR/000 -> NOTE (their outage, never ours)"
   else
     row "selftest" "ext" "BAD" "-" "severity" "an outage classified WARN — strict mode would fail on someone else's server"
+    st_fail=1
+  fi
+  # 10b. Transient 4xx. Added in #25 after a real 429 turned this gate red on a
+  #      live URL that was fine minutes later. Asserted in BOTH directions,
+  #      because the failure has two sides: too strict makes the path flake to
+  #      FAIL and invites someone to pass --external-lenient; too loose would
+  #      swallow a genuine 404. So 429/408 must be NOTE AND 404/403/410 must
+  #      still be WARN. One assertion alone cannot tell those apart.
+  if [ "$(ext_severity 429)" = "NOTE" ] && [ "$(ext_severity 408)" = "NOTE" ]; then
+    row "selftest" "ext" "OK" "-" "severity" "429/408 -> NOTE (throttled/timeout, ask again later)"
+  else
+    row "selftest" "ext" "BAD" "-" "severity" "429/408 classified WARN — a rate limit can fail this run"
+    st_fail=1
+  fi
+  if [ "$(ext_severity 403)" = "WARN" ] && [ "$(ext_severity 404)" = "WARN" ] \
+     && [ "$(ext_severity 410)" = "WARN" ]; then
+    row "selftest" "ext" "OK" "-" "severity" "403/404/410 still WARN (the 429 fix did not widen)"
+  else
+    row "selftest" "ext" "BAD" "-" "severity" "a real dead citation now classifies NOTE — the 429 fix swallowed 4xx"
     st_fail=1
   fi
 
