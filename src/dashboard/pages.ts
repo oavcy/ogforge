@@ -74,8 +74,11 @@ const CSS = `
   }
   .nav-logo span { color: var(--accent); }
   .nav-links { display: flex; gap: 24px; align-items: center; }
-  .nav-links a { color: var(--text-2); font-size: 14px; }
-  .nav-links a:hover { color: var(--text-1); text-decoration: none; }
+  /* :not(.btn) matters. The bare descendant selector is specificity 0-1-1 and .btn-primary
+     is 0-1-0, so without it the nav CTA loses its own colour and renders #A3A3A3 on amber
+     — about 1.5:1, illegible. It shipped that way until cycle #14. */
+  .nav-links a:not(.btn) { color: var(--text-2); font-size: 14px; }
+  .nav-links a:not(.btn):hover { color: var(--text-1); text-decoration: none; }
   .btn {
     display: inline-flex; align-items: center; justify-content: center;
     font-family: var(--font-mono); font-size: 13px; font-weight: 500;
