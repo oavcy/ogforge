@@ -148,9 +148,19 @@ async function recordUsage(
 // read `[]` forever while the thing actually worked. A gate that cannot register
 // success is the same defect as one that cannot go red.
 //
-// Writes ONLY for a cross-origin Referer — direct hits, crawlers and internal
-// navigation store nothing, which both bounds the table and makes every row mean
-// exactly one thing. Host only; never the full referring URL.
+// Writes ONLY for a cross-origin Referer — direct hits and same-origin navigation
+// store nothing. Host only; never the full referring URL.
+//
+// CORRECTED Cycle #43. This comment used to claim crawlers store nothing and that
+// "every row means exactly one thing." Both were false. The test below is three
+// conditions — a Referer header is present, it parses as a URL, and its host is
+// not ours — and NOT ONE OF THEM LOOKS AT WHO IS ASKING. There is no bot check
+// (there cannot be: we deliberately never read the user agent), no rate limit and
+// no dedupe. So ONE agent making N requests writes N rows, and the owner can add
+// a row from a shell with `curl -H 'Referer: https://example.com/'`. Measured:
+// ids 6–10 arrived at 19:37:37/38/39/39/40 — five rows in four seconds, two in one
+// second, all path `/`, all ref_host `github.com`. That is one client, not five
+// readers. A row is a REQUEST that carried an off-site Referer. Nothing more.
 //
 // Deliberately fire-and-forget via waitUntil and wrapped in a catch: an
 // instrumentation failure must never turn a readable page into a 500. The read
@@ -224,7 +234,10 @@ app.get('/postmortem/hits', async c => {
       referrers: rows,
       note:
         'Cross-origin Referer hosts only. Direct traffic and same-origin navigation ' +
-        'are not recorded. Host only — no URLs, IPs, user agents or identifiers.',
+        'are not recorded. Host only — no URLs, IPs, user agents or identifiers. ' +
+        'Counts are REQUESTS, not visitors: there is no bot filter, no rate limit ' +
+        'and no dedupe, so one client making N requests reports as N hits. Do not ' +
+        'read these numbers as an audience.',
     });
   } catch (err) {
     // Report the failure instead of pretending the answer is zero. An instrument
