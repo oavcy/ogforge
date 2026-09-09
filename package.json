@@ -5,8 +5,10 @@
   "private": true,
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
+    "deploy": "wrangler deploy && npm run check:assets",
+    "deploy:only": "wrangler deploy",
     "typecheck": "tsc --noEmit",
+    "check:assets": "./scripts/check-assets.sh",
     "db:local": "wrangler d1 migrations apply snapog-db --local",
     "db:remote": "wrangler d1 migrations apply snapog-db",
     "staging:deploy": "wrangler deploy --env staging"
