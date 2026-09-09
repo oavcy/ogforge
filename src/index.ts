@@ -609,15 +609,17 @@ app.get('/favicon.svg', _c =>
 app.get('/favicon.ico', c => c.redirect('/favicon.svg', 301));
 
 // Ours, with directives that actually exist. Disallowing /dashboard and
-// /register keeps authenticated and form-only pages out of indexes; they are
-// useless as search results and /dashboard 400s without a key anyway.
+// Keep key-scoped and admin paths out of indexes. /dashboard genuinely needs a
+// key, so it is worthless as a search result. /register is NOT in that category
+// and used to be lumped in with it (cycle #21): it is a plain 200 HTML page and
+// the only conversion point of a free product, so "free og image api key" ought
+// to be able to land there. "Form-only" is not the same thing as "authenticated".
 app.get('/robots.txt', c => {
   const site = origin(c.req.url);
   const body = [
     'User-agent: *',
     'Allow: /',
     'Disallow: /dashboard',
-    'Disallow: /register',
     'Disallow: /admin/',
     '',
     `Sitemap: ${site}/sitemap.xml`,
@@ -632,14 +634,17 @@ app.get('/robots.txt', c => {
   });
 });
 
-// Only the two pages worth indexing. /register is a form and /dashboard needs a
-// key, so neither belongs here.
+// Everything publicly useful. /dashboard is key-scoped so it stays out; /register
+// is in as of cycle #21 (see robots.txt above). /demo.png was missing while
+// /brand.png was listed — same kind of asset, no reason for the asymmetry.
 app.get('/sitemap.xml', c => {
   const site = origin(c.req.url);
   const body = `<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
   <url><loc>${site}/</loc><changefreq>weekly</changefreq><priority>1.0</priority></url>
+  <url><loc>${site}/register</loc><changefreq>monthly</changefreq><priority>0.8</priority></url>
   <url><loc>${site}/brand.png</loc><changefreq>monthly</changefreq><priority>0.3</priority></url>
+  <url><loc>${site}/demo.png</loc><changefreq>monthly</changefreq><priority>0.3</priority></url>
 </urlset>
 `;
   return new Response(body, {
