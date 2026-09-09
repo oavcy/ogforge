@@ -159,7 +159,13 @@ TOTAL=0; PASSED=0; FAILED=0; SKIPPED=0
 # self-test silently stops emitting rows. A shrinking self-test is invisible
 # otherwise: every remaining row still says OK.
 ST_ROWS=0; ST_BAD=0
-ST_ROWS_MIN=59     # rows emitted on 2026-09-09 (Cycle #26). Raise only with a run.
+# Floor on CHECK rows only — the meta/coverage rows the floor itself emits are
+# excluded by construction (the count is read before they exist). 59 was measured
+# on 2026-09-09 (Cycle #26). #26 A3 standing: DO NOT raise this. It is lowerable
+# by one character, which is the whole reason it is a tripwire and not a floor;
+# its value was never the problem, so "finishing the job" by raising it does
+# nothing. It is tracked, so any change to it shows in a diff and in git blame.
+ST_ROWS_MIN=59
 FAILLOG="$WORKDIR/failures.txt"
 : > "$FAILLOG"
 
@@ -881,7 +887,10 @@ self_test() {
     printf '%s' '<LINK REL="preconnect" HREF="https://qa-upper.selftest-9f3a1c/">'
     printf '%s' '<link href="https://qa-gt.selftest-9f3a1c/" data-note="a>b" rel="preconnect">'
     printf '%s' '<script type="application/ld+json">{"url":"/qa-ldjson","x":"https://schema.org"}</script>'
-    printf '%s' '</head><body><script>'
+    printf '%s' '</head><body>'
+    printf '%s' '<IMG SRC="/qa-upper-img.png" ALT="x">'
+    printf '%s' '<a HREF="/qa-upper-link">up</a>'
+    printf '%s' '<script>'
     printf '  el.textContent = "it%ss done"; fetch(%s/qa-after-apostrophe.json%s);' \
            "$st_sq" "$st_sq" "$st_sq"
     printf '  // we don%st retry here\n  router.add(%s/user/:id%s, h);' "$st_sq" "$st_sq" "$st_sq"
@@ -904,6 +913,10 @@ self_test() {
     'multi-token rel keeps the stylesheet in the fetch set'
   st_qa_check present "^hint${st_tab}https://qa-upper.selftest-9f3a1c/$" \
     'uppercase <LINK REL=...> is recognised as a hint'
+  st_qa_check present "^image${st_tab}/qa-upper-img.png$" \
+    'uppercase <IMG SRC=...> reaches the generic image sweep, not just the hint detector'
+  st_qa_check present "^link${st_tab}/qa-upper-link$" \
+    'uppercase <a HREF=...> reaches the generic href sweep'
   st_qa_check present "^hint${st_tab}https://qa-gt.selftest-9f3a1c/$" \
     "'>' inside an attribute value does not defeat the hint exclusion"
   st_qa_check present "^asset${st_tab}/qa-after-apostrophe.json$" \
@@ -1011,10 +1024,49 @@ self_test() {
     row "selftest" "meta" "BAD" "$st_rows_measured" "coverage-floor" \
       "self-test emitted ${st_rows_measured} rows, floor is ${ST_ROWS_MIN} — coverage was silently lost"
     st_fail=1
+  else
+    row "selftest" "meta" "OK" "$st_rows_measured" "coverage-floor" \
+      "row count ${st_rows_measured} is at or above the floor of ${ST_ROWS_MIN}"
+  fi
+
+  # Cycle #27, Mutation C. The block above used to be SILENT when it passed, so
+  # deleting the whole thing changed no output at all: 40/40, PASS, exit 0, tally
+  # byte-identical. #26 shipped it knowing that and named it an open defect.
+  # It now emits in both branches, which turns its absence from invisible into
+  # arithmetic: exactly one meta row must exist, so the live counter must have
+  # advanced by exactly one since it was read.
+  #
+  # This does NOT eliminate #26 A4's terminus ("every gate terminates in one
+  # assertion nothing else checks"), and the first draft of this comment claimed
+  # the two blocks check EACH OTHER. Measured, that is false. It is a chain, not
+  # a mutual pair:
+  #
+  #   delete a real check (Mut A)  -> floor fires        -> exit 2   CAUGHT
+  #   delete the floor    (Mut C)  -> this block fires   -> exit 2   CAUGHT (new)
+  #   delete THIS block   (Mut E)  -> nothing fires      -> exit 0   NOT CAUGHT
+  #   delete both     (Mut C+E)    -> nothing fires      -> exit 0   NOT CAUGHT
+  #
+  # So the terminus moved out one level; it did not disappear. What was bought:
+  # the undetectable edit is no longer "delete a silent block that appears to do
+  # nothing" but "delete a block whose stated purpose is to catch that deletion",
+  # and Mut C+E still prints "+ 0 coverage" in the tally where a green run prints
+  # "+ 1" — visible to a reader, not to the exit code. Do not add a third block
+  # to guard this one; that just relabels the terminus again.
+  st_meta_rows=$((ST_ROWS - st_rows_measured))
+  if [ "$st_meta_rows" -ne 1 ]; then
+    row "selftest" "meta" "BAD" "$st_meta_rows" "coverage-floor-ran" \
+      "the coverage floor emitted ${st_meta_rows} rows, not 1 — the floor check itself is missing or duplicated"
+    st_fail=1
   fi
 
   hr
-  echo "SELF-TEST TALLY  rows: ${st_rows_measured}   bad: ${ST_BAD}   floor: ${ST_ROWS_MIN}"
+  # ST_ROWS is read HERE, after every meta row has been emitted, so this number
+  # equals the reproduce command's output in every branch. #26's version printed
+  # the pre-meta count, which matched `grep -c` only when the run was green —
+  # i.e. the tally disagreed with its own reproduce line exactly when something
+  # was wrong. Splitting it into "checks + coverage rows" keeps the floor
+  # comparison legible without lying about the total.
+  echo "SELF-TEST TALLY  rows: ${ST_ROWS}   (${st_rows_measured} checks + $((ST_ROWS - st_rows_measured)) coverage)   bad: ${ST_BAD}   floor: ${ST_ROWS_MIN}"
   echo "                 reproduce with: ./scripts/check-assets.sh | grep -c '^selftest '"
   if [ "$st_fail" -ne 0 ]; then
     echo "SELF-TEST FAILED. THIS CHECKER IS UNTRUSTWORTHY — do not read anything into"
@@ -1100,32 +1152,42 @@ extract_refs() {
   # That is the same defect class as the split-element wordmark: the reference was
   # THERE, the gate simply could not see that shape of it, and an unseen reference
   # is indistinguishable from a healthy one in the summary line.
+  #
+  # Tag and attribute NAMES are matched case-insensitively (`-oiE`), because HTML
+  # permits `<IMG SRC=...>` exactly as much as `<img src=...>`. For 27 cycles only
+  # the hint detector knew that — it runs in awk over tolower(tag) — so an
+  # uppercase attribute was recognised as a hint to EXCLUDE while being invisible
+  # to every sweep that would have fetched it. Fixed in Cycle #28; the fixture that
+  # proves it is `qa-upper-img.png` / `qa-upper-link`, and it was red first.
+  # The value strip is `^[A-Za-z-]*=` rather than a literal attribute name for the
+  # same reason: it cannot know the case grep matched. It stays exact because
+  # `[A-Za-z-]*` cannot cross the quote, so only the real attribute name is cut.
   _sq=$(printf '\047')
   for _q in '"' "$_sq"; do
     # <img src="..."> — the category that produced the 19-cycle defect. Tracked by
     # tag, not by file extension, because /og?title=... has no extension at all.
-    grep -oE '<img[^>]*>' "$_flat" 2>/dev/null \
-      | grep -oE "src=${_q}[^${_q}]*${_q}" | sed -e "s/^src=${_q}//" -e "s/${_q}\$//" \
+    grep -oiE '<img[^>]*>' "$_flat" 2>/dev/null \
+      | grep -oiE "src=${_q}[^${_q}]*${_q}" | sed -e "s/^[A-Za-z-]*=${_q}//" -e "s/${_q}\$//" \
       | awk '{print "image\t" $0}'
     # <link rel="icon"|"apple-touch-icon" href="...">
-    grep -oE '<link[^>]*>' "$_flat" 2>/dev/null | grep -iE "rel=${_q}[^${_q}]*icon" \
-      | grep -oE "href=${_q}[^${_q}]*${_q}" | sed -e "s/^href=${_q}//" -e "s/${_q}\$//" \
+    grep -oiE '<link[^>]*>' "$_flat" 2>/dev/null | grep -iE "rel=${_q}[^${_q}]*icon" \
+      | grep -oiE "href=${_q}[^${_q}]*${_q}" | sed -e "s/^[A-Za-z-]*=${_q}//" -e "s/${_q}\$//" \
       | awk '{print "image\t" $0}'
     # social unfurl images — these break silently and only in someone else's UI.
     # Match the URL-bearing properties EXACTLY: og:image:width/height/alt and
     # twitter:image:alt carry a number or prose, not a URL, and treating them as
     # assets produces confident nonsense like "GET /1200 -> 404".
-    grep -oE '<meta[^>]*>' "$_flat" 2>/dev/null \
+    grep -oiE '<meta[^>]*>' "$_flat" 2>/dev/null \
       | grep -iE "(property|name)=${_q}(og:image(:(url|secure_url))?|twitter:image(:src)?)${_q}" \
-      | grep -oE "content=${_q}[^${_q}]*${_q}" | sed -e "s/^content=${_q}//" -e "s/${_q}\$//" \
+      | grep -oiE "content=${_q}[^${_q}]*${_q}" | sed -e "s/^[A-Za-z-]*=${_q}//" -e "s/${_q}\$//" \
       | awk '{print "image\t" $0}'
     # every other src= (script, iframe, source, video, audio)
-    grep -oE "src=${_q}[^${_q}]*${_q}" "$_flat" 2>/dev/null \
-      | sed -e "s/^src=${_q}//" -e "s/${_q}\$//" \
+    grep -oiE "src=${_q}[^${_q}]*${_q}" "$_flat" 2>/dev/null \
+      | sed -e "s/^[A-Za-z-]*=${_q}//" -e "s/${_q}\$//" \
       | awk '{print "asset\t" $0}'
     # every href= (stylesheets, routes, in-page nav) — from the hint-stripped copy
-    grep -oE "href=${_q}[^${_q}]*${_q}" "$_nohint" 2>/dev/null \
-      | sed -e "s/^href=${_q}//" -e "s/${_q}\$//" \
+    grep -oiE "href=${_q}[^${_q}]*${_q}" "$_nohint" 2>/dev/null \
+      | sed -e "s/^[A-Za-z-]*=${_q}//" -e "s/${_q}\$//" \
       | awk '{print "link\t" $0}'
   done
   # CSS url(...) — <style> blocks, inline style="", @font-face. A background image
