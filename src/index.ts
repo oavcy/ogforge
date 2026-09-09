@@ -1,4 +1,4 @@
-// SnapOG — Main Cloudflare Worker
+// OGForge — Main Cloudflare Worker
 // Routes: GET /og (image gen), GET / (landing), GET/POST /register, GET /dashboard
 
 import { Hono } from 'hono';
@@ -200,8 +200,8 @@ app.get('/og', async c => {
         'Content-Type': 'image/png',
         'Cache-Control': 'public, max-age=86400, s-maxage=604800',
         'X-Cache': 'HIT',
-        'X-SnapOG-Tier': apiKey.tier,
-        'X-SnapOG-Quota-Charged': 'false',
+        'X-OGForge-Tier': apiKey.tier,
+        'X-OGForge-Quota-Charged': 'false',
       },
     });
   }
@@ -243,8 +243,8 @@ app.get('/og', async c => {
       'Content-Type': 'image/png',
       'Cache-Control': 'public, max-age=86400, s-maxage=604800',
       'X-Cache': 'MISS',
-      'X-SnapOG-Tier': apiKey.tier,
-      'X-SnapOG-Quota-Charged': 'true',
+      'X-OGForge-Tier': apiKey.tier,
+      'X-OGForge-Quota-Charged': 'true',
     },
   });
 });

@@ -1,6 +1,11 @@
-# SnapOG
+# OGForge
 
 Generate Open Graph images via API — Cloudflare Workers, cached on R2, sub-100ms on cache hit.
+
+> Formerly **SnapOG**. Renamed because `snapog.dev` is a live, unrelated product with the
+> same name — the collision was ours to fix, not theirs. The Worker hostname below still
+> reads `snapog` and is staying that way: renaming it would break the only public URL we
+> have, and nothing here is worth a broken link.
 
 **Live instance:** <https://snapog.aoadmin.workers.dev> · **License:** MIT
 
@@ -24,12 +29,37 @@ If you are already on Cloudflare, **self-hosting is the better deal and we are n
 to pretend otherwise** — that is why the whole thing is MIT and why the deploy path below
 is written to actually work rather than to nudge you back to the hosted one.
 
+## Quick Start — hosted, no signup form, no install
+
+Two commands. Both were run against the live instance on 2026-09-09 and the output pasted
+below is the real output, not an illustration.
+
+```bash
+# 1. Get a free key (100 renders/month). Returns an HTML page; grab the key out of it.
+KEY=$(curl -s -X POST https://snapog.aoadmin.workers.dev/register \
+  --data-urlencode "email=you@example.com" | grep -oE 'sk_[a-f0-9]{64}' | head -1)
+
+# 2. Render a card
+curl "https://snapog.aoadmin.workers.dev/og?title=Hello+from+the+README&domain=example.com&key=$KEY" \
+  --output og.png
+```
+
+```
+$ file og.png
+og.png: PNG image data, 1200 x 630, 8-bit/color RGBA, non-interlaced
+```
+
+Prefer a browser? <https://snapog.aoadmin.workers.dev/register> is the same thing with a form.
+
+Response headers worth knowing: `x-cache: HIT|MISS` and `x-ogforge-quota-charged: true|false`.
+**A cache hit is free** — only a fresh render decrements your 100.
+
 ## Self-Hosting
 
 Four commands from clone to a live OG endpoint on your own account:
 
 ```bash
-git clone https://github.com/oavcy/snapog.git && cd snapog
+git clone https://github.com/oavcy/ogforge.git && cd ogforge
 npm install
 
 # 1. Provision D1 + R2 on your account, then paste the printed database_id
@@ -54,7 +84,7 @@ which returns `503` while it is unset.
 green, deploys green, and then 500s on every request with `env.DB` undefined. `wrangler.toml`
 here repeats the bindings in full under each environment for exactly that reason.
 
-## Quick Start
+## Quick Start — local dev
 
 ```bash
 # Local: start the dev server (see "Local Development"), register a key at
@@ -81,8 +111,8 @@ Returns `image/png`, 1200×630.
 
 Headers:
 - `X-Cache: HIT|MISS` — whether served from R2 cache
-- `X-SnapOG-Tier: free|pro|business`
-- `X-SnapOG-Quota-Charged: true|false` — whether this request consumed quota
+- `X-OGForge-Tier: free|pro|business`
+- `X-OGForge-Quota-Charged: true|false` — whether this request consumed quota
 
 ## Quota model
 
@@ -113,8 +143,14 @@ Replace `<your-worker>.workers.dev` with your own deployment host.
 
 Every key gets **100 rendered images per month**. Cache hits are free and
 unmetered, and already-cached images keep serving after the limit is reached.
-Rendered images carry a small "SnapOG" watermark. Each email address may hold at
+Rendered images carry a small "OGForge" watermark. Each email address may hold at
 most **3 API keys** — extra keys are not a way to get extra renders.
+
+**Known issue (2026-09-09):** images rendered *before* the rename are still in R2 with the
+old "SnapOG" watermark, because the watermark text is not part of the cache key. Those
+objects are immutable and will keep serving as-is; a request with any different parameter
+renders fresh. Not purging them — deleting stored objects is outside what this project is
+allowed to do, and the blast radius is a handful of test images.
 
 There is nothing to buy. A visitor who tells us 100/month wasn't enough is
 recorded in the `tier_interest` table via `POST /interest`; that table is the
@@ -126,7 +162,7 @@ unset by default (the endpoint then returns 503).
 
 ### Prerequisites
 - Node.js 18+, npm
-- Wrangler (`npm install -g wrangler`)
+- Wrangler — no global install needed; it is a devDependency, invoke it as `npx wrangler`
 - A Cloudflare account with Workers access
 
 ### Setup
@@ -136,7 +172,7 @@ cd projects/snapog
 npm install
 
 # 1. Create D1 database
-wrangler d1 create snapog-db
+npx wrangler d1 create snapog-db
 # Copy the returned database_id into wrangler.toml [d1_databases]
 
 # 2. Apply migrations locally
@@ -177,17 +213,17 @@ built from the request host, so there is no domain to configure.
 
 ```bash
 # 1. Create remote D1 database
-wrangler d1 create snapog-db
+npx wrangler d1 create snapog-db
 # Update wrangler.toml with the database_id
 
 # 2. Apply migrations to remote
 npm run db:remote
 
 # 3. Create R2 bucket
-wrangler r2 bucket create snapog-og-cache
+npx wrangler r2 bucket create snapog-og-cache
 
 # 4. Deploy
-wrangler deploy
+npx wrangler deploy
 ```
 
 ## Tech Stack
@@ -200,7 +236,7 @@ wrangler deploy
 
 ## Project status, stated plainly
 
-SnapOG was built as a hosted product and then judged **commercially non-viable by its own
+OGForge (then named SnapOG) was built as a hosted product and then judged **commercially non-viable by its own
 team**: `workers-og` is a free MIT library, the people who need this are mostly already on
 a platform that can run it, and the $19–49 hosted tier is occupied by Placid, APITemplate.io
 and Bannerbear. We did not find a wedge. Publishing the source is the honest consequence of

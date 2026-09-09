@@ -1,4 +1,4 @@
-// SnapOG — Dashboard & landing page HTML
+// OGForge — Dashboard & landing page HTML
 // Aesthetic: "Carbon Terminal" — dark developer tool, amber accent, monospace-first
 
 import type { ApiKey } from '../types';
@@ -392,7 +392,7 @@ function layout(title: string, body: string, extraHead = ''): string {
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>${title} — SnapOG</title>
+  <title>${title} — OGForge</title>
   <meta name="description" content="Generate stunning Open Graph images via API. Hosted on Cloudflare edge, cached globally, delivered in milliseconds." />
   <style>${CSS}</style>
   ${extraHead}
@@ -403,9 +403,9 @@ function layout(title: string, body: string, extraHead = ''): string {
 </html>`;
 }
 
-// Public source. SnapOG is MIT — the self-host path is a first-class option, not a
+// Public source. OGForge is MIT — the self-host path is a first-class option, not a
 // fallback, so the link belongs in the nav rather than buried in a footer.
-const REPO_URL = 'https://github.com/oavcy/snapog';
+const REPO_URL = 'https://github.com/oavcy/ogforge';
 
 function nav(_activePath = '/'): string {
   return `
@@ -424,7 +424,7 @@ function footer(): string {
   return `
   <footer class="footer">
     <div class="container">
-      SnapOG — OG images at the edge. MIT-licensed, built on Cloudflare Workers.
+      OGForge — OG images at the edge. MIT-licensed, built on Cloudflare Workers.
       <a href="${REPO_URL}" style="color:var(--text-2);">Source on GitHub ↗</a>
     </div>
   </footer>`;
@@ -451,7 +451,7 @@ export function landingPage(
       <h1>OG images for every URL,<br/><em>delivered at the edge</em></h1>
       <p class="hero-sub">
         One API call. Instant PNG. Cached globally on Cloudflare CDN.
-        Stop hand-coding OG templates — let SnapOG generate them dynamically.
+        Stop hand-coding OG templates — let OGForge generate them dynamically.
       </p>
       <div class="hero-cta">
         <a href="/register" class="btn btn-primary" style="font-size:15px;padding:12px 28px;">Get Free API Key</a>
@@ -542,7 +542,7 @@ export function landingPage(
   <!-- Features -->
   <section class="section" style="padding-top:0;">
     <div class="container">
-      <p class="section-title">Why SnapOG</p>
+      <p class="section-title">Why OGForge</p>
       <h2 class="section-h2">Four things a one-off snippet won't do for you</h2>
       <div class="features-grid">
         <div class="feature-card">
@@ -589,7 +589,7 @@ export function landingPage(
             <li>Images already cached keep serving after the limit is reached</li>
             <li>3 templates, dark and light</li>
             <li>3 keys per email address</li>
-            <li class="dim">Rendered images carry a small SnapOG watermark</li>
+            <li class="dim">Rendered images carry a small OGForge watermark</li>
           </ul>
           <div style="margin-top:28px;">
             <a href="/register" class="btn btn-ghost" style="width:100%;">Get a key →</a>
