@@ -316,6 +316,9 @@ export function postmortemPage(site: string): string {
 <meta property="og:description" content="${desc}">
 <meta property="og:url" content="${url}">
 <meta property="og:image" content="${site}/brand.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="OGForge — ${POSTMORTEM_TITLE}">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="${POSTMORTEM_TITLE}">
 <meta name="twitter:description" content="${desc}">

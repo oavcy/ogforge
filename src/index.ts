@@ -541,7 +541,7 @@ app.get('/demo.png', c => {
 });
 
 // ── Registration ──────────────────────────────────────────────────────────────
-app.get('/register', _c => htmlResponse(registerPage()));
+app.get('/register', c => htmlResponse(registerPage(origin(c.req.url))));
 
 app.post('/register', async c => {
   let email: string, keyname: string, tier: string;
@@ -551,11 +551,11 @@ app.post('/register', async c => {
     keyname = (form.get('keyname') as string ?? '').trim() || 'default';
     tier = (form.get('tier') as string ?? 'free').trim();
   } catch {
-    return htmlResponse(registerPage('Invalid form data'), 400);
+    return htmlResponse(registerPage(origin(c.req.url), 'Invalid form data'), 400);
   }
 
   if (!email || !EMAIL_RE.test(email)) {
-    return htmlResponse(registerPage('Please enter a valid email address'), 400);
+    return htmlResponse(registerPage(origin(c.req.url), 'Please enter a valid email address'), 400);
   }
 
   // Nothing on the site asks for a tier any more, but the guard stays: a
@@ -590,7 +590,7 @@ app.post('/register', async c => {
     .bind(email)
     .first<{ id: string }>();
   if (!user) {
-    return htmlResponse(registerPage('Database error — please try again'), 500);
+    return htmlResponse(registerPage(origin(c.req.url), 'Database error — please try again'), 500);
   }
 
   // Generate API key
@@ -628,6 +628,7 @@ app.post('/register', async c => {
   if ((inserted.meta?.changes ?? 0) === 0) {
     return htmlResponse(
       registerPage(
+        origin(c.req.url),
         `${email} already has ${MAX_KEYS_PER_EMAIL} API keys — that's the maximum. ` +
           `Use one you already have, or open its dashboard to check usage. ` +
           `Each key gets its own monthly allowance, so extra keys are not a way to get extra images.`
@@ -748,7 +749,7 @@ app.get('/dashboard', async c => {
     // present on every page that answered 4xx to everyone who clicked it.
     // Reserve 4xx for requests that are actually wrong (see the 404 below, for
     // a key that was supplied and does not exist).
-    return htmlResponse(registerPage('Enter your API key or create a new one below'));
+    return htmlResponse(registerPage(origin(c.req.url), 'Enter your API key or create a new one below'));
   }
 
   const apiKey = await resolveApiKey(c.env.DB, rawKey);

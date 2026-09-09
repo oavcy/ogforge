@@ -393,9 +393,24 @@ const CSS = `
 // og:image points at /brand.png, our own API's output. Dogfooding is the whole
 // argument: a preview card rendered by anything else would be a claim, this one
 // is a demonstration.
-function socialHead(origin: string, title: string, description: string): string {
-  const url = `${origin}/`;
-  const image = `${origin}/brand.png`;
+//
+// Cycle #50: `path` and `image` became parameters because this helper had exactly
+// one caller (landingPage) and hardcoded `${origin}/`. Every other page therefore
+// shipped ZERO og tags rather than wrong ones — /register emitted none of the four
+// properties ogp.me calls required for every page, while sitemap.xml declared it
+// indexable. Reusing the helper unchanged would have been worse than the omission:
+// it would have made /register assert `og:url = /`, i.e. claim to be the homepage.
+// A shared meta helper whose URL is fixed at the top of the file is a defect
+// generator, not a convenience.
+function socialHead(
+  origin: string,
+  title: string,
+  description: string,
+  path = '/',
+  image = '/brand.png'
+): string {
+  const url = `${origin}${path}`;
+  const imageUrl = image.startsWith('http') ? image : `${origin}${image}`;
   return `
   <link rel="canonical" href="${esc(url)}" />
   <meta property="og:type" content="website" />
@@ -403,15 +418,24 @@ function socialHead(origin: string, title: string, description: string): string 
   <meta property="og:url" content="${esc(url)}" />
   <meta property="og:title" content="${esc(title)}" />
   <meta property="og:description" content="${esc(description)}" />
-  <meta property="og:image" content="${esc(image)}" />
+  <meta property="og:image" content="${esc(imageUrl)}" />
   <meta property="og:image:width" content="1200" />
   <meta property="og:image:height" content="630" />
   <meta property="og:image:alt" content="${esc(title)}" />
   <meta name="twitter:card" content="summary_large_image" />
   <meta name="twitter:title" content="${esc(title)}" />
   <meta name="twitter:description" content="${esc(description)}" />
-  <meta name="twitter:image" content="${esc(image)}" />`;
+  <meta name="twitter:image" content="${esc(imageUrl)}" />`;
 }
+
+// ogp.me: "The four required properties for every page are" og:title, og:type,
+// og:image, og:url. /dashboard, the key-created page and the error pages are not
+// graph objects — /dashboard is already Disallow-ed in robots.txt and the
+// key-created page renders a live `sk_…` in its body. The standards-correct move
+// for a page that should not be shared is to SAY so, not to omit the properties
+// and leave a crawler to guess. Omission is what those pages did before #50, and
+// it is indistinguishable from the bug we just fixed on /register.
+const PRIVATE_HEAD = '<meta name="robots" content="noindex, nofollow" />';
 
 function layout(title: string, body: string, extraHead = ''): string {
   return `<!DOCTYPE html>
@@ -742,7 +766,14 @@ export function landingPage(
   );
 }
 
-export function registerPage(error?: string): string {
+// The og:image here is /demo.png?title=… — the keyless, parameterised path shipped
+// in Cycle #50's predecessor. So the share card for our signup page is rendered by
+// the API the signup page sells, with that page's own headline, through the one
+// endpoint a stranger can call without a key. That is the difference between
+// claiming the product works and handing over a URL that proves it.
+const REGISTER_OG_TITLE = 'Start generating — free OG images';
+
+export function registerPage(origin: string, error?: string): string {
   const body = `
   ${nav()}
   <section class="section">
@@ -778,7 +809,17 @@ export function registerPage(error?: string): string {
   </section>
   ${footer()}`;
 
-  return layout('Get API Key', body);
+  return layout(
+    'Get API Key',
+    body,
+    socialHead(
+      origin,
+      'Get an OGForge API key',
+      'One email, one key, 100 rendered 1200×630 PNGs a month. No password, no card.',
+      '/register',
+      `/demo.png?title=${encodeURIComponent(REGISTER_OG_TITLE)}`
+    )
+  );
 }
 
 export function keyCreatedPage(
@@ -847,7 +888,7 @@ export function keyCreatedPage(
     });
   </script>`;
 
-  return layout('API Key Created', body);
+  return layout('API Key Created', body, PRIVATE_HEAD);
 }
 
 export function dashboardPage(
@@ -940,7 +981,7 @@ export function dashboardPage(
   </div>
   ${footer()}`;
 
-  return layout('Dashboard', body);
+  return layout('Dashboard', body, PRIVATE_HEAD);
 }
 
 export function errorPage(code: number, message: string): string {
@@ -956,5 +997,5 @@ export function errorPage(code: number, message: string): string {
   </section>
   ${footer()}`;
 
-  return layout(`${code} Error`, body);
+  return layout(`${code} Error`, body, PRIVATE_HEAD);
 }
