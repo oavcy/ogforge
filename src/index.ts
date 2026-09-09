@@ -499,9 +499,45 @@ app.get('/brand.png', c => {
   recordInboundHit(c, HIT_PATHS.brand);
   return serveStaticCard(c, BRAND_CARD, BRAND_CARD_KEY);
 });
+// Cycle #49: this handler ignored its query string. Two requests differing only
+// by `?title=` returned byte-identical 42,251-byte bodies — measured, not assumed.
+// That matters because Show HN's published guidelines, fetched in #49, say
+// verbatim: "Please make it easy for users to try your thing out, ideally without
+// barriers such as signups or emails." We failed that line twice over: `/og` is
+// 401 without a key, and the one keyless path was a photograph of the product
+// rather than the product. A stranger had no way to make this API do anything.
+//
+// So `title` — and only `title` — is now honoured. Everything the comment above
+// claims for DEMO_CARD still holds: no key, no D1 quota, no user control over
+// theme, template, domain, tag or author. The cache key is derived from the
+// normalised title, so a repeat render is an R2 GET rather than a rasterise, and
+// the unparameterised request keeps its original key and therefore its warm
+// object. The exposure this opens is one unauthenticated rasterise per distinct
+// title, bounded by DEMO_TITLE_MAX; that is stated here rather than discovered later.
+const DEMO_TITLE_MAX = 120;
+
+// Same alphabet as the rest of the cache namespace: a stable 32-bit hash keeps the
+// key printable and fixed-length, and collisions only ever serve one demo card in
+// place of another — there is nothing private in this namespace to leak.
+function demoTitleKey(title: string): string {
+  let h = 2166136261;
+  for (let i = 0; i < title.length; i++) {
+    h ^= title.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return `og/demo/v1-${(h >>> 0).toString(36)}.png`;
+}
+
 app.get('/demo.png', c => {
   recordInboundHit(c, HIT_PATHS.demo);
-  return serveStaticCard(c, DEMO_CARD, DEMO_CARD_KEY);
+
+  const raw = c.req.query('title');
+  const title = raw?.trim().slice(0, DEMO_TITLE_MAX);
+  if (!title) {
+    return serveStaticCard(c, DEMO_CARD, DEMO_CARD_KEY);
+  }
+
+  return serveStaticCard(c, { ...DEMO_CARD, title }, demoTitleKey(title));
 });
 
 // ── Registration ──────────────────────────────────────────────────────────────
