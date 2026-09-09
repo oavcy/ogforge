@@ -749,7 +749,12 @@ app.get('/dashboard', async c => {
     // present on every page that answered 4xx to everyone who clicked it.
     // Reserve 4xx for requests that are actually wrong (see the 404 below, for
     // a key that was supplied and does not exist).
-    return htmlResponse(registerPage(origin(c.req.url), 'Enter your API key or create a new one below'));
+    // 'other' is load-bearing: this is /dashboard, not /register. Without it the
+    // register page's canonical and og:url name /register while the request URL is
+    // /dashboard — see the note on registerPage.
+    return htmlResponse(
+      registerPage(origin(c.req.url), 'Enter your API key or create a new one below', 'other')
+    );
   }
 
   const apiKey = await resolveApiKey(c.env.DB, rawKey);

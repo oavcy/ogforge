@@ -773,7 +773,25 @@ export function landingPage(
 // claiming the product works and handing over a URL that proves it.
 const REGISTER_OG_TITLE = 'Start generating — free OG images';
 
-export function registerPage(origin: string, error?: string): string {
+// `servedAt` exists because this page is returned from TWO routes: `/register`,
+// where the social block is correct, and keyless `/dashboard`, where it is not.
+// Adding the social block above fixed a missing-metadata defect on /register and
+// created a WRONG-metadata defect on /dashboard: a stranger with no key got a 200
+// whose `<link rel="canonical">` and `og:url` both named `/register` — a different
+// URL than the one that answered. That is the exact failure the comment on
+// socialHead warns about ("it would have made /register assert og:url = /"), and
+// this function walked into it one route over, in the same commit.
+//
+// Wrong metadata is worse than none: absent tags make a crawler fall back to the
+// request URL, while a canonical naming another page actively asks it to drop this
+// one. The head must describe the URL that served it, so the non-canonical route
+// gets PRIVATE_HEAD — which is also what robots.txt already says about /dashboard
+// (`Disallow: /dashboard`) and what dashboardPage() itself already emits.
+export function registerPage(
+  origin: string,
+  error?: string,
+  servedAt: '/register' | 'other' = '/register'
+): string {
   const body = `
   ${nav()}
   <section class="section">
@@ -812,13 +830,15 @@ export function registerPage(origin: string, error?: string): string {
   return layout(
     'Get API Key',
     body,
-    socialHead(
-      origin,
-      'Get an OGForge API key',
-      'One email, one key, 100 rendered 1200×630 PNGs a month. No password, no card.',
-      '/register',
-      `/demo.png?title=${encodeURIComponent(REGISTER_OG_TITLE)}`
-    )
+    servedAt === '/register'
+      ? socialHead(
+          origin,
+          'Get an OGForge API key',
+          'One email, one key, 100 rendered 1200×630 PNGs a month. No password, no card.',
+          '/register',
+          `/demo.png?title=${encodeURIComponent(REGISTER_OG_TITLE)}`
+        )
+      : PRIVATE_HEAD
   );
 }
 
