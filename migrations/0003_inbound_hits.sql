@@ -19,8 +19,19 @@
 --   to us" is precisely the event being measured.
 --
 -- PRIVACY
---   Referrer HOST only. No full URL, no path, no query string, no IP, no user agent,
---   no cookie, no identifier of any kind. Day granularity on the date column.
+--   Of the REFERRER: host only. Never its full URL, its path or its query string. No
+--   IP, no user agent, no cookie, no identifier of any kind.
+--
+--   That list describes the referrer, NOT the table. Two columns below describe this
+--   site rather than the visitor, and reading the list as a table inventory makes
+--   `path TEXT NOT NULL` four lines down look like a contradiction of "no path":
+--     path     OUR landing path (e.g. `/postmortem/self-certifying-ci-gate`) — ours,
+--              never the referrer's. Not exposed by GET /postmortem/hits.
+--     seen_at  SECOND precision, not day. `day` is the day-granular column; seen_at
+--              is where an exact last-hit time is read from (MAX(seen_at)) when a
+--              cycle needs one. Also not exposed by the endpoint, which aggregates
+--              to MIN(day)/MAX(day) — so a second-precision baseline cannot be
+--              verified by curling that endpoint, only by querying D1.
 
 CREATE TABLE IF NOT EXISTS inbound_hits (
   id        INTEGER PRIMARY KEY AUTOINCREMENT,
