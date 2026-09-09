@@ -3,6 +3,33 @@ main = "src/index.ts"
 compatibility_date = "2024-11-01"
 compatibility_flags = ["nodejs_compat"]
 
+# Cycle #52: per-version preview URLs are DISABLED.
+#
+# Cloudflare publishes every uploaded version at its own public hostname,
+# `<version-id-prefix>-snapog.aoadmin.workers.dev`, and this defaults to ON.
+# Measured before this line existed: 20 versions listed, **18 of them returned
+# 200 to an anonymous GET**, and `/postmortem/hits` on a preview host was
+# byte-identical to production's — the same D1, the same R2, the same secrets.
+#
+# The consequence is that a fix is not in effect when it is deployed; it is only
+# in effect on ONE of the hostnames serving this worker. Cycle #51 pinned the
+# scheme to https and added a 301 so a credential could not reach validation
+# over cleartext. Measured while that fix was live in production:
+#   http://a9489ab0-snapog.aoadmin.workers.dev/          -> 200 (no redirect)
+#   http://a9489ab0-snapog.aoadmin.workers.dev/og?title=x -> 401, redirects=0,
+#     body {"error":"key parameter is required..."} — this app's own handler,
+#     reached over plaintext, on the version immediately preceding the fix.
+# Every past fix has the same shape: still reachable at its predecessor's URL.
+#
+# Bound on this removal, because a removal is not a control (#35):
+#  - It does not delete the versions. They remain in `wrangler versions list`
+#    and can be re-exposed by deleting this line.
+#  - It does not retroactively protect anything already sent to a preview host.
+#  - Cloudflare already sent `x-robots-tag: noindex` on these hosts, so the
+#    duplicate-content half of this was ALREADY mitigated by the platform and is
+#    not a reason claimed for this change. The reason is the bypass, only.
+preview_urls = false
+
 [[d1_databases]]
 binding = "DB"
 database_name = "snapog-db"
