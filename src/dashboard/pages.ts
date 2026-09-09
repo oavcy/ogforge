@@ -386,6 +386,33 @@ const CSS = `
   }
 `;
 
+// Meta tags a social crawler reads when someone shares our link. Absolute URLs
+// are mandatory here — Slack, Discord, Twitter and iMessage all discard a
+// relative og:image, which is why this takes an origin instead of using '/'.
+//
+// og:image points at /brand.png, our own API's output. Dogfooding is the whole
+// argument: a preview card rendered by anything else would be a claim, this one
+// is a demonstration.
+function socialHead(origin: string, title: string, description: string): string {
+  const url = `${origin}/`;
+  const image = `${origin}/brand.png`;
+  return `
+  <link rel="canonical" href="${esc(url)}" />
+  <meta property="og:type" content="website" />
+  <meta property="og:site_name" content="OGForge" />
+  <meta property="og:url" content="${esc(url)}" />
+  <meta property="og:title" content="${esc(title)}" />
+  <meta property="og:description" content="${esc(description)}" />
+  <meta property="og:image" content="${esc(image)}" />
+  <meta property="og:image:width" content="1200" />
+  <meta property="og:image:height" content="630" />
+  <meta property="og:image:alt" content="${esc(title)}" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="${esc(title)}" />
+  <meta name="twitter:description" content="${esc(description)}" />
+  <meta name="twitter:image" content="${esc(image)}" />`;
+}
+
 function layout(title: string, body: string, extraHead = ''): string {
   return `<!DOCTYPE html>
 <html lang="en">
@@ -685,7 +712,15 @@ export function landingPage(
     });
   </script>`;
 
-  return layout('Generate OG images at the edge', body);
+  return layout(
+    'Generate OG images at the edge',
+    body,
+    socialHead(
+      origin,
+      'OGForge — Open Graph images, generated at the edge',
+      'One GET request returns a 1200×630 PNG. No SDK, no browser, no build step. Free tier, no card.'
+    )
+  );
 }
 
 export function registerPage(error?: string): string {

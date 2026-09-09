@@ -249,6 +249,70 @@ app.get('/og', async c => {
   });
 });
 
+// ── Our own social card ───────────────────────────────────────────────────────
+// An OG image API whose own pages had no OG tags shipped for 17 cycles: every
+// time anyone shared our link, it rendered as a bare blue string. Fixing that
+// needs an image URL a social crawler can fetch — and crawlers do not carry API
+// keys, so /og could never serve it.
+//
+// This route is deliberately NOT a keyless /og. Query params are ignored and the
+// content is hard-coded, so it cannot be used as a free general-purpose
+// generator. It touches neither D1 nor the quota ledger.
+//
+// It renders through buildElement — the same code path a paying request takes.
+// That is the point: the card that advertises the API is an *output* of the API,
+// so it cannot drift from what the product actually produces. If rendering
+// breaks, our own preview breaks first, and we find out before a customer does.
+const BRAND_CARD: OGParams = {
+  title: 'Open Graph images, generated at the edge',
+  description: 'One GET request returns a 1200×630 PNG. No SDK, no browser, no build step.',
+  domain: 'ogforge',
+  tag: 'API',
+  // Rendered by the template's footer row. Without it the lower third of the
+  // card is empty, which reads as unfinished in a feed. Showing the literal
+  // request turns that dead space into the one thing a reader needs to act on:
+  // the claim above becomes a concrete URL shape.
+  author: 'GET /og?title=Your+Title → PNG',
+  theme: 'dark',
+  template: 'default',
+};
+
+// Bump when BRAND_CARD or the templates change, so the cached object is replaced
+// rather than served stale forever behind the long max-age below.
+const BRAND_CARD_KEY = 'og/brand/v2.png';
+
+app.get('/brand.png', async c => {
+  const cached = await c.env.OG_CACHE.get(BRAND_CARD_KEY);
+  if (cached) {
+    return new Response(await cached.arrayBuffer(), {
+      headers: {
+        'Content-Type': 'image/png',
+        'Cache-Control': 'public, max-age=86400, s-maxage=604800',
+        'X-Cache': 'HIT',
+        'X-OGForge-Rendered-By': 'ogforge',
+      },
+    });
+  }
+
+  const imageResponse = await generateOGImage(BRAND_CARD, false);
+  const imageBuffer = await imageResponse.arrayBuffer();
+
+  c.executionCtx.waitUntil(
+    c.env.OG_CACHE.put(BRAND_CARD_KEY, imageBuffer.slice(0), {
+      httpMetadata: { contentType: 'image/png' },
+    })
+  );
+
+  return new Response(imageBuffer, {
+    headers: {
+      'Content-Type': 'image/png',
+      'Cache-Control': 'public, max-age=86400, s-maxage=604800',
+      'X-Cache': 'MISS',
+      'X-OGForge-Rendered-By': 'ogforge',
+    },
+  });
+});
+
 // ── Registration ──────────────────────────────────────────────────────────────
 app.get('/register', _c => htmlResponse(registerPage()));
 
