@@ -162,6 +162,37 @@ async function recordUsage(
 // second, all path `/`, all ref_host `github.com`. That is one client, not five
 // readers. A row is a REQUEST that carried an off-site Referer. Nothing more.
 //
+// SCOPE — this function is CALLED PER ROUTE, and for fifteen cycles nothing wrote
+// down which routes. Cycle #44 counted: 2 call sites against 11 paths that return
+// 200. Nine paths recorded nothing and no comment, doc or consensus line said so.
+// That is Cycle #43's defect with the sign flipped: #43's comment claimed an
+// exclusion the code does not implement, this was an exclusion the code implements
+// that no prose stated. An unstated scope is the defect, not the narrowness.
+//
+// Instrumented (4): `/` · the postmortem page · /brand.png · /demo.png.
+// CANNOT produce a row, so not a choice — no realistic client sends a
+// cross-origin Referer for them: /robots.txt, /sitemap.xml, /favicon.svg,
+// /health. Do not "fix" these; physics decided, not us.
+// DELIBERATELY not recorded (3): /register — the funnel's bottom already writes
+// `users` and `tier_interest` with an email, which is strictly stronger evidence
+// than a host, and all four internal links to it are same-origin anyway;
+// /dashboard — a cross-origin Referer here would mean a user leaked their API key
+// in public, which is a security event, not demand; /postmortem/hits — the read
+// side of this very table, recording itself.
+//
+// The scope above is prose, and #41 A2 is that an expectation the code does not
+// measure is a hope with a `#` in front. So the four instrumented paths live in
+// ONE constant, read by both the call sites and the public JSON. A fifth call site
+// would have to pass a bare literal to escape this list, which is now the visibly
+// odd shape in the file. A stranger can audit the coverage without our source:
+// GET /postmortem/hits returns `instrumented_paths`.
+const HIT_PATHS = {
+  landing: '/',
+  postmortem: POSTMORTEM_PATH,
+  brand: '/brand.png',
+  demo: '/demo.png',
+} as const;
+
 // Deliberately fire-and-forget via waitUntil and wrapped in a catch: an
 // instrumentation failure must never turn a readable page into a 500. The read
 // side (GET /postmortem/hits) is where a problem would surface.
@@ -194,7 +225,7 @@ function recordInboundHit(c: Context<{ Bindings: Env }>, path: string): void {
 
 // Landing page
 app.get('/', c => {
-  recordInboundHit(c, '/');
+  recordInboundHit(c, HIT_PATHS.landing);
   return htmlResponse(landingPage(origin(c.req.url)));
 });
 
@@ -203,7 +234,7 @@ app.get('/', c => {
 // nothing is sold; it exists because it is the one thing this company has that is
 // both genuinely useful to strangers and entirely honest.
 app.get(POSTMORTEM_PATH, c => {
-  recordInboundHit(c, POSTMORTEM_PATH);
+  recordInboundHit(c, HIT_PATHS.postmortem);
   return htmlResponse(postmortemPage(origin(c.req.url)));
 });
 
@@ -232,12 +263,20 @@ app.get('/postmortem/hits', async c => {
       distinct_referrer_hosts: rows.length,
       total_inbound_hits: rows.reduce((sum, r) => sum + r.hits, 0),
       referrers: rows,
+      // Cycle #44: the coverage is now a value, not a sentence. This endpoint
+      // reported a total for fifteen cycles without ever saying which paths could
+      // contribute to it, and the answer was 2 of the 11 that return 200.
+      instrumented_paths: Object.values(HIT_PATHS),
       note:
         'Cross-origin Referer hosts only. Direct traffic and same-origin navigation ' +
         'are not recorded. Host only — no URLs, IPs, user agents or identifiers. ' +
         'Counts are REQUESTS, not visitors: there is no bot filter, no rate limit ' +
         'and no dedupe, so one client making N requests reports as N hits. Do not ' +
-        'read these numbers as an audience.',
+        'read these numbers as an audience. PARTIAL COVERAGE: only the paths in ' +
+        'instrumented_paths can produce a row. This service answers 200 on 11 paths; ' +
+        'a visit to any other one is invisible here, so a zero is not proof nobody ' +
+        'came. /register and /dashboard are deliberately excluded; robots.txt, ' +
+        'sitemap.xml, favicon.svg and /health cannot carry a cross-origin Referer.',
     });
   } catch (err) {
     // Report the failure instead of pretending the answer is zero. An instrument
@@ -447,8 +486,23 @@ async function serveStaticCard(
   return new Response(imageBuffer, { headers: headers('MISS') });
 }
 
-app.get('/brand.png', c => serveStaticCard(c, BRAND_CARD, BRAND_CARD_KEY));
-app.get('/demo.png', c => serveStaticCard(c, DEMO_CARD, DEMO_CARD_KEY));
+// These two record, and they are the highest-value rows this instrument can
+// write. /brand.png is the og:image of BOTH the landing page (dashboard/pages.ts,
+// og:image) and the postmortem (dashboard/postmortem.ts, og:image + twitter:image).
+// Every reference to it from our own HTML is same-origin and is therefore dropped
+// by the host test in recordInboundHit — so the noise floor here is zero, and a
+// cross-origin Referer on an image means one specific thing: A THIRD PARTY
+// EMBEDDED OUR CARD ON THEIR PAGE. That is a publication event. It needs no click
+// and no human intent to be captured, which is exactly why it is worth more than a
+// page view. Cycle #44 found these two were being thrown away.
+app.get('/brand.png', c => {
+  recordInboundHit(c, HIT_PATHS.brand);
+  return serveStaticCard(c, BRAND_CARD, BRAND_CARD_KEY);
+});
+app.get('/demo.png', c => {
+  recordInboundHit(c, HIT_PATHS.demo);
+  return serveStaticCard(c, DEMO_CARD, DEMO_CARD_KEY);
+});
 
 // ── Registration ──────────────────────────────────────────────────────────────
 app.get('/register', _c => htmlResponse(registerPage()));
