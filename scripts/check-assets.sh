@@ -188,6 +188,34 @@ row() { # page kind verdict status ct url reason
 
 hr() { printf '%s\n' "----------------------------------------------------------------------------------------------------"; }
 
+# --------------------------------------------------------------- canonical head
+# Cycle #50 shipped a `<link rel="canonical">` on /dashboard that named /register,
+# and this gate fetched /dashboard, got 200, and passed it. Nothing here compared
+# what a page CLAIMS to be against the URL that actually served it, so the whole
+# class was invisible. These two functions are that comparison.
+#
+# Absent canonical is NOT a failure: /dashboard and the error pages are noindex on
+# purpose, and a crawler with no canonical falls back to the request URL, which is
+# correct. Only a canonical naming a DIFFERENT address is a defect.
+page_canonical() { # body-file -> href on stdout, empty if none
+  tr '\n\r\t' '   ' < "$1" \
+    | grep -oE '<link[^>]+rel="canonical"[^>]*>' \
+    | grep -oE 'href="[^"]*"' \
+    | head -1 | sed -e 's/^href="//' -e 's/"$//'
+}
+
+# Compare a canonical against the URL that answered, ignoring a single trailing
+# slash (a server may canonicalize "/x" and "/x/" to one form legitimately).
+# Returns 0 = MISMATCH detected, 1 = agrees or absent.
+canonical_mismatch() { # body-file effective-url
+  _can=$(page_canonical "$1")
+  [ -n "$_can" ] || return 1
+  _eff=$(printf '%s' "$2" | sed -e 's/#.*$//' -e 's|/$||')
+  _can=$(printf '%s' "$_can" | sed -e 's|/$||')
+  [ "$_can" = "$_eff" ] && return 1
+  return 0
+}
+
 # ------------------------------------------------------------------- URL helpers
 # Normalize a raw attribute value to an absolute URL on BASE, or emit nothing if
 # the reference is out of scope (external host, anchor, mailto:, data:, ...).
@@ -537,6 +565,40 @@ self_test() {
   # 4b. The exact markup that defeated four rename audits, plus a <style> block
   #     to prove CSS is not mistaken for prose. The negative case matters just as
   #     much: if render_text returned nothing, every page would "pass" forever.
+  # ---- canonical-vs-serving-URL (added #51; the class that #50 shipped live) ----
+  # Four fixtures, because this check has two ways to be useless: always-green
+  # (never catches the foreign canonical) and always-red (flags noindex pages and
+  # the -L redirect that legitimately moved the URL).
+  st_can="$WORKDIR/selftest-canonical.html"
+  printf '%s' '<html><head><link rel="canonical" href="https://example.org/register" /></head><body>x</body></html>' > "$st_can"
+  if canonical_mismatch "$st_can" "https://example.org/dashboard"; then
+    row "selftest" "head" "OK" "-" "canonical" "foreign canonical -> correctly detected (the #50 defect)"
+  else
+    row "selftest" "head" "BAD" "-" "canonical" "foreign canonical NOT detected — this check is decorative"
+    st_fail=1
+  fi
+  printf '%s' '<html><head><link rel="canonical" href="https://example.org/register" /></head><body>x</body></html>' > "$st_can"
+  if canonical_mismatch "$st_can" "https://example.org/register"; then
+    row "selftest" "head" "BAD" "-" "canonical" "agreeing canonical flagged — check is always-red"
+    st_fail=1
+  else
+    row "selftest" "head" "OK" "-" "canonical" "agreeing canonical -> correctly passed (not always-red)"
+  fi
+  printf '%s' '<html><head><meta name="robots" content="noindex, nofollow" /></head><body>x</body></html>' > "$st_can"
+  if canonical_mismatch "$st_can" "https://example.org/dashboard"; then
+    row "selftest" "head" "BAD" "-" "canonical" "absent canonical flagged — noindex pages would be permanently red"
+    st_fail=1
+  else
+    row "selftest" "head" "OK" "-" "canonical" "absent canonical -> correctly NOT a defect"
+  fi
+  printf '%s' '<html><head><link rel="canonical" href="https://example.org/x/" /></head><body>x</body></html>' > "$st_can"
+  if canonical_mismatch "$st_can" "https://example.org/x"; then
+    row "selftest" "head" "BAD" "-" "canonical" "trailing-slash-only difference flagged as a mismatch"
+    st_fail=1
+  else
+    row "selftest" "head" "OK" "-" "canonical" "trailing slash tolerated -> not a mismatch"
+  fi
+
   st_html="$WORKDIR/selftest-brand.html"
   printf '%s' '<html><head><style>.x{content:"OGForge"}</style></head><body><nav><a class="nav-logo" href="/">Snap<span>OG</span></a></nav><p>hello</p></body></html>' > "$st_html"
   if render_text "$st_html" | grep -q 'SnapOG'; then
@@ -1297,9 +1359,15 @@ scan_page() {
   page_out=$(curl -sS -L --compressed \
                   --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" \
                   -A "$UA" -o "$body" \
-                  -w '%{http_code}|%{content_type}' "${BASE}${page_path}" 2>/dev/null)
+                  -w '%{http_code}|%{content_type}|%{url_effective}' "${BASE}${page_path}" 2>/dev/null)
   p_status=$(printf '%s' "$page_out" | awk -F'|' '{print $1}')
   p_ct=$(printf '%s' "$page_out" | awk -F'|' '{print $2}' | sed -e 's/;.*$//' -e 's/[[:space:]]//g')
+  # This curl uses -L. Per the #39 finding, %{http_code} and friends describe
+  # wherever the request ENDED UP, so the canonical must be compared against
+  # url_effective and NOT against "${BASE}${page_path}" — otherwise the very
+  # redirect that makes a page legitimate would be reported as a mismatch.
+  p_eff=$(printf '%s' "$page_out" | awk -F'|' '{print $3}')
+  [ -n "$p_eff" ] || p_eff="${BASE}${page_path}"
 
   echo
   echo "PAGE ${page_path}   (expected status: ${expected})"
@@ -1322,6 +1390,20 @@ scan_page() {
   if grep -qE "(src|href)='" "$body"; then
     echo "WARNING: single-quoted src/href attributes present on this page."
     echo "         This parser only reads double-quoted attributes, so those are UNCHECKED."
+  fi
+
+  # What the page CLAIMS TO BE, as opposed to the URL that served it. (#50/#51)
+  TOTAL=$((TOTAL + 1))
+  page_can=$(page_canonical "$body")
+  if canonical_mismatch "$body" "$p_eff"; then
+    FAILED=$((FAILED + 1))
+    row "$label" "head" "FAIL" "$p_status" "canonical" "$page_can" \
+        "canonical names a different URL than the one that served it ($p_eff)"
+    printf '%s\t%s\t%s\t%s\n' "$label" "head" "$p_eff" \
+        "canonical=$page_can does not match the serving URL" >> "$FAILLOG"
+  else
+    PASSED=$((PASSED + 1))
+    row "$label" "head" "PASS" "$p_status" "canonical" "${page_can:-none (noindex/absent — OK)}"
   fi
 
   # What the page SAYS, as opposed to what it is made of.

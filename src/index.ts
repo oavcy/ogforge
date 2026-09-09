@@ -63,11 +63,35 @@ function generateRawKey(): string {
   return 'sk_' + Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
+// `wrangler dev` serves plaintext and https://localhost:8787 answers nothing, so
+// the scheme pinning below must not reach it. Kept as a named predicate because
+// two places need the same exemption and they must not drift apart.
+function isLocalHost(hostname: string): boolean {
+  return (
+    hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1'
+  );
+}
+
 // Every copy-pasteable example on the site is built from the URL the visitor
 // actually reached us on. Hardcoding a domain here is how a service ends up
 // documenting an address that does not exist.
+//
+// The SCHEME is the exception, and cycle #51 is why. `http://` was served, not
+// redirected, and this function handed the request scheme to every absolute URL
+// on the site: `/`, `/register` and the postmortem each returned 200 with a
+// self-referencing `http://` canonical, and `sitemap.xml` listed five `http://`
+// <loc>s — i.e. it did not merely tolerate the duplicates, it submitted them for
+// indexing. Note what this is NOT: every one of those heads was truthful about
+// the URL that served it, so #50's invariant held at every route and the site
+// still declared two canonical identities for the same three pages. A
+// per-response invariant cannot see a defect that only exists across responses.
+// ogp.me defines og:url as "the canonical URL of the object", not the request
+// URL, so pinning the scheme is what that spec asks for rather than a deviation
+// from it.
 function origin(requestUrl: string): string {
-  return new URL(requestUrl).origin;
+  const url = new URL(requestUrl);
+  if (!isLocalHost(url.hostname)) url.protocol = 'https:';
+  return url.origin;
 }
 
 function htmlResponse(html: string, status = 200): Response {
@@ -220,6 +244,40 @@ function recordInboundHit(c: Context<{ Bindings: Env }>, path: string): void {
       })
   );
 }
+
+// ─── Transport ────────────────────────────────────────────────────────────────
+// Pinning the scheme in origin() fixes what the pages SAY. It does not remove
+// the second URL: without this, http:// still answers 200 and a crawler that
+// reaches it is being asked to trust an annotation instead of finding one door.
+// The stronger reason is not SEO. This worker takes its credential as a query
+// parameter (`/og?key=sk_…`), and over http it reached its own validation code:
+// measured this cycle, `curl http://…/og?title=…` returns this app's own
+// `{"error":"key parameter is required…"}` 401, not a redirect — so a real key
+// would have travelled, in the URL, in cleartext. A 301 is the only response
+// that removes the plaintext path rather than documenting it.
+//
+// HSTS (RFC 6797) covers the case the redirect cannot: the FIRST request, which
+// is already on the wire before any redirect can be sent.
+//
+// This is app.use, not app.get/post — the public surface stays 16 distinct paths
+// / 18 registrations, and the counting greps in consensus.md still return those.
+app.use('*', async (c, next) => {
+  const url = new URL(c.req.url);
+  if (url.protocol === 'http:' && !isLocalHost(url.hostname)) {
+    url.protocol = 'https:';
+    return c.redirect(url.toString(), 301);
+  }
+  await next();
+  // Re-wrap so the headers are mutable regardless of how the handler built its
+  // Response; setting on an immutable headers object throws.
+  if (!isLocalHost(url.hostname)) {
+    c.res = new Response(c.res.body, c.res);
+    c.res.headers.set(
+      'Strict-Transport-Security',
+      'max-age=31536000; includeSubDomains'
+    );
+  }
+});
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
