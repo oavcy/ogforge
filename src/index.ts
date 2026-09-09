@@ -936,15 +936,63 @@ app.get('/robots.txt', c => {
 // Everything publicly useful. /dashboard is key-scoped so it stays out; /register
 // is in as of cycle #21 (see robots.txt above). /demo.png was missing while
 // /brand.png was listed — same kind of asset, no reason for the asymmetry.
+//
+// Cycle #54: `<changefreq>` and `<priority>` are GONE from all five entries, and
+// `<lastmod>` was deliberately NOT added in their place. Both halves of that need
+// their reason on the record, because the removal looks like a loss of signal and
+// the omission looks like an oversight, and neither is.
+//
+// Why the two fields went. Both are legal — sitemaps.org marks all three optional,
+// so no validator would ever have flagged this file. Against the one consumer whose
+// rules we actually fetched, they are inert:
+//
+//   "Google ignores <priority> and <changefreq> values."
+//     -- developers.google.com/search/docs/crawling-indexing/sitemaps/build-sitemap
+//        (fetched 2026-09-10, HTTP 200, redirects=0)
+//
+// and the protocol spec itself says changefreq "is considered a hint and not a
+// command" and that priority "is not likely to influence the position of your URLs".
+// So the ten values here were read by nobody we can name — and two of them were
+// false. This file told crawlers `${POSTMORTEM_PATH}` changes `yearly` while that
+// page's bytes changed in cycles #50, #51, #52 and #53 — four consecutive cycles —
+// and that `/` changes `weekly` while it changed several times in a single day.
+// A claim with no readership is still a claim, and these were wrong.
+//
+// Why <lastmod> is NOT here, which is the harder half. It is the one field Google
+// says it reads, so adding it is the obvious "fix" — and it is a trap:
+//
+//   "Google uses the <lastmod> value if it's consistently and verifiably (for
+//    example by comparing to the last modification of the page) accurate."
+//
+// The use is CONDITIONAL on accuracy, and we have no per-page modification signal
+// we can keep accurate. There is no build step, no CMS and no content table; every
+// page here is rendered by this worker's code. The only date available at runtime
+// is the worker's own deploy time (a `version_metadata` binding), and that is an
+// upper bound, not a modification date: a deploy that touches only robots.txt would
+// bump the lastmod of all five URLs. A date that is routinely too recent is exactly
+// the inconsistency the sentence above conditions on, so that binding would buy a
+// field Google then learns to distrust.
+//
+// The remaining option is hardcoding dates in this file. That is worse. Nothing
+// would go red when a cycle edits a page and forgets to bump its date, so the value
+// would rot silently into a falsehood that looks like evidence of freshness — a
+// prop, by this company's own definition. Cycle #50 A3 states it directly: fixing
+// an omission can install an assertion, and assertions can be false.
+//
+// Absent is honest. Emitting <loc> alone is Google's documented minimum minus a
+// field we cannot support, and it is what this site can actually stand behind.
+// If a real per-page modification signal ever exists, add <lastmod> then — the
+// gate already checks that any lastmod appearing here is a valid W3C date and is
+// not in the future, so the anti-relapse check is live before the field is.
 app.get('/sitemap.xml', c => {
   const site = origin(c.req.url);
   const body = `<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-  <url><loc>${site}/</loc><changefreq>weekly</changefreq><priority>1.0</priority></url>
-  <url><loc>${site}/register</loc><changefreq>monthly</changefreq><priority>0.8</priority></url>
-  <url><loc>${site}${POSTMORTEM_PATH}</loc><changefreq>yearly</changefreq><priority>0.9</priority></url>
-  <url><loc>${site}/brand.png</loc><changefreq>monthly</changefreq><priority>0.3</priority></url>
-  <url><loc>${site}/demo.png</loc><changefreq>monthly</changefreq><priority>0.3</priority></url>
+  <url><loc>${site}/</loc></url>
+  <url><loc>${site}/register</loc></url>
+  <url><loc>${site}${POSTMORTEM_PATH}</loc></url>
+  <url><loc>${site}/brand.png</loc></url>
+  <url><loc>${site}/demo.png</loc></url>
 </urlset>
 `;
   return new Response(body, {

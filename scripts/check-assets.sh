@@ -256,6 +256,70 @@ response_says_noindex() { # header-file body-file
     | grep -qi 'noindex'
 }
 
+# ------------------------------------------------- sitemap field discipline (#54)
+# Cycle #53 found a defect in the COMPOSITION of two mechanisms that were each
+# correct. Cycle #54 asked the same question one rung out — not "do two of MY
+# mechanisms compose?" but "does my mechanism compose with the CONSUMER's published
+# rule for reading it?" — and the sitemap answered:
+#
+#   "Google ignores <priority> and <changefreq> values."
+#   "Google uses the <lastmod> value if it's consistently and verifiably (for
+#    example by comparing to the last modification of the page) accurate."
+#     -- developers.google.com/search/docs/crawling-indexing/sitemaps/build-sitemap
+#        (fetched 2026-09-10, HTTP 200, redirects=0)
+#
+# Every entry carried the two ignored fields and none carried the one that is read.
+# Both halves were individually valid — sitemaps.org marks all three optional, so
+# no XML validator would ever flag this — and together they conveyed nothing, while
+# two of the values were false (`yearly` on a page that changed in four consecutive
+# cycles; `weekly` on `/`, which changes several times a day).
+#
+# Prints one line per defect; empty output means clean. A predicate rather than an
+# inline block so the self-test can drive it on synthetic fixtures, including the
+# reconstructed pre-#54 sitemap that MUST come back red.
+#
+# The <lastmod> assertions are deliberately live before the field is. If a future
+# cycle adds lastmod, this is already waiting to reject a malformed or future date
+# — the two ways that field goes wrong without anything else noticing.
+sitemap_field_defects() { # sitemap-body-file today-YYYY-MM-DD
+  _sf="$1"; _stoday="$2"
+  # An unreadable sitemap makes every verdict below vacuous. Say so; never let an
+  # empty input read as a clean result (#41).
+  [ -s "$_sf" ] || { echo "UNREADABLE: sitemap is empty or was not fetched"; return 0; }
+  grep -q '<urlset' "$_sf" 2>/dev/null || {
+    echo "NOT-A-SITEMAP: no <urlset> element — this is not a sitemap document"; return 0; }
+
+  _scf=$(grep -o '<changefreq>' "$_sf" 2>/dev/null | wc -l | tr -d ' ')
+  [ "$_scf" -gt 0 ] && \
+    echo "IGNORED-FIELD: ${_scf} <changefreq> element(s) — Google publishes that it ignores these"
+  _spr=$(grep -o '<priority>' "$_sf" 2>/dev/null | wc -l | tr -d ' ')
+  [ "$_spr" -gt 0 ] && \
+    echo "IGNORED-FIELD: ${_spr} <priority> element(s) — Google publishes that it ignores these"
+
+  _su=$(grep -o '<url>' "$_sf" 2>/dev/null | wc -l | tr -d ' ')
+  _sl=$(grep -o '<loc>' "$_sf" 2>/dev/null | wc -l | tr -d ' ')
+  [ "$_su" -eq "$_sl" ] || \
+    echo "SHAPE: ${_su} <url> element(s) but ${_sl} <loc> — every <url> needs exactly one <loc>"
+  [ "$_su" -gt 0 ] || \
+    echo "EMPTY: <urlset> contains zero <url> entries — a sitemap that submits nothing"
+
+  # Any <lastmod> that IS present must be a W3C Datetime and must not be in the
+  # future. A future modification date cannot be true of any page.
+  grep -o '<lastmod>[^<]*</lastmod>' "$_sf" 2>/dev/null \
+    | sed -e 's|<lastmod>||' -e 's|</lastmod>||' \
+    | while IFS= read -r _sd; do
+        case "$_sd" in
+          [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]|[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*) ;;
+          *) echo "BAD-LASTMOD: '${_sd}' is not W3C Datetime (YYYY-MM-DD or a full timestamp)"
+             continue ;;
+        esac
+        if [ "$(printf '%s' "$_sd" | cut -c1-10)" \> "$_stoday" ]; then
+          echo "FUTURE-LASTMOD: '${_sd}' is later than today (${_stoday}) — cannot be a modification date"
+        fi
+      done
+  return 0
+}
+
 # ------------------------------------------------------------------- URL helpers
 # Normalize a raw attribute value to an absolute URL on BASE, or emit nothing if
 # the reference is out of scope (external host, anchor, mailto:, data:, ...).
@@ -1140,6 +1204,60 @@ self_test() {
     fi
   done
 
+  # 16b. SITEMAP FIELD DISCIPLINE (#54). Eight fixtures, driven through the same
+  #      predicate the live check uses. The first is the reconstructed pre-#54
+  #      sitemap: if this gate could not go red on the exact document that was
+  #      served until this cycle, it would be certifying its own fix. The second
+  #      is the current shape and MUST come back clean, because a check that
+  #      flags every sitemap is worth nothing.
+  #
+  #      Note what is NOT asserted here: that <lastmod> is present. #54 refused to
+  #      add it (no per-page modification signal can be kept accurate), so an
+  #      always-red "missing lastmod" rule would have been a trap set for a future
+  #      cycle. These rows police the field's CORRECTNESS if it ever appears.
+  st_smdir="$WORKDIR/selftest-sitemaps"; mkdir -p "$st_smdir"
+  st_sm_today=$(date -u +%Y-%m-%d)
+  st_sm_future=$(date -u -v+30d +%Y-%m-%d 2>/dev/null || date -u -d '+30 days' +%Y-%m-%d 2>/dev/null || echo "2099-01-01")
+  st_sm_head='<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+
+  printf '%s\n  <url><loc>%s/</loc><changefreq>weekly</changefreq><priority>1.0</priority></url>\n  <url><loc>%s/register</loc><changefreq>monthly</changefreq><priority>0.8</priority></url>\n</urlset>\n' \
+    "$st_sm_head" "$BASE" "$BASE" > "$st_smdir/pre54.xml"
+  printf '%s\n  <url><loc>%s/</loc></url>\n  <url><loc>%s/register</loc></url>\n</urlset>\n' \
+    "$st_sm_head" "$BASE" "$BASE" > "$st_smdir/current.xml"
+  printf '%s\n  <url><loc>%s/</loc><lastmod>2026-01-15</lastmod></url>\n</urlset>\n' \
+    "$st_sm_head" "$BASE" > "$st_smdir/lastmod-ok.xml"
+  printf '%s\n  <url><loc>%s/</loc><lastmod>%s</lastmod></url>\n</urlset>\n' \
+    "$st_sm_head" "$BASE" "$st_sm_future" > "$st_smdir/lastmod-future.xml"
+  printf '%s\n  <url><loc>%s/</loc><lastmod>last Tuesday</lastmod></url>\n</urlset>\n' \
+    "$st_sm_head" "$BASE" > "$st_smdir/lastmod-bad.xml"
+  printf '%s\n  <url><loc>%s/</loc></url>\n  <url></url>\n</urlset>\n' \
+    "$st_sm_head" "$BASE" > "$st_smdir/shape.xml"
+  printf '%s\n</urlset>\n' "$st_sm_head" > "$st_smdir/empty-urlset.xml"
+  : > "$st_smdir/unfetchable.xml"
+
+  for st_case in \
+    "2|pre54.xml|the sitemap served until #54 — 2 ignored-field defects" \
+    "0|current.xml|the shape #54 deploys — <loc> only, must be clean" \
+    "0|lastmod-ok.xml|a valid past <lastmod> is accepted, not flagged" \
+    "1|lastmod-future.xml|a <lastmod> in the future is rejected" \
+    "1|lastmod-bad.xml|a non-W3C-Datetime <lastmod> is rejected" \
+    "1|shape.xml|a <url> with no <loc> is rejected" \
+    "1|empty-urlset.xml|a <urlset> submitting zero URLs is rejected" \
+    "1|unfetchable.xml|an empty/unfetched sitemap reports UNREADABLE, never a pass"
+  do
+    st_want=${st_case%%|*}; st_rest=${st_case#*|}
+    st_file=${st_rest%%|*}; st_desc=${st_rest#*|}
+    st_got=$(sitemap_field_defects "$st_smdir/$st_file" "$st_sm_today" | grep -c .)
+    if [ "$st_got" = "$st_want" ]; then
+      row "selftest" "smap" "OK" "$st_got" "field-discipline" "$st_desc"
+    else
+      row "selftest" "smap" "BAD" "$st_got" "field-discipline" \
+          "$st_desc — got ${st_got} defect(s), wanted ${st_want}"
+      st_fail=1
+    fi
+  done
+
   # 17. THE EXIT CODE ITSELF. Every assertion above tests a pure function; none of
   #     them would notice if the exit-code block were deleted. That block is the
   #     one thing this design cites as making the external class falsifiable
@@ -1831,6 +1949,49 @@ if [ "$MODE" != "docs-only" ]; then
         row "$nr_lbl" "robots" "-" "-" "noindex-reach" "no noindex directive (indexable — nothing to reach)"
       fi
     done
+  fi
+fi
+
+# ---- live sitemap field discipline (#54) -------------------------------------
+# The sitemap must not ship fields the consumer publishes as ignored, and any
+# <lastmod> it does ship must be a date that could be true. Runs against the live
+# site, anonymously. Falsifiable: RED before #54's deploy (ten ignored fields,
+# two of them false), GREEN after.
+if [ "$MODE" != "docs-only" ]; then
+  echo
+  echo "SITEMAP FIELD DISCIPLINE   (fields the consumer ignores, and dates that cannot be true)"
+  hr
+  sm_body="$WORKDIR/live-sitemap.xml"
+  curl -sS -L --compressed --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" \
+       -A "$UA" -o "$sm_body" "${BASE}/sitemap.xml" 2>/dev/null || :
+  sm_today=$(date -u +%Y-%m-%d)
+  sm_defects="$WORKDIR/sitemap-defects.txt"
+  sitemap_field_defects "$sm_body" "$sm_today" > "$sm_defects"
+  # `grep -c .` PRINTS 0 and EXITS 1 when there are no matches, so the obvious
+  # `$(grep -c . f || echo 0)` captures BOTH the count and the fallback — sm_n
+  # becomes the two-line string "0\n0", every integer test on it errors, and the
+  # check reports "FAIL — 0 defect(s)". Caught by this gate on its own first run:
+  # the self-test's clean fixture said 0 while the live check said FAIL, and only
+  # the disagreement between them made it visible. Same family as #33 — a shell
+  # construct that conflates a value with the signal that there was no value.
+  # Read the count on its own, then take the first line.
+  sm_n=$(grep -c . "$sm_defects" 2>/dev/null | head -1)
+  sm_n=${sm_n:-0}
+  sm_locs=$(grep -o '<loc>' "$sm_body" 2>/dev/null | wc -l | tr -d ' ')
+  TOTAL=$((TOTAL + 1))
+  if [ "$sm_n" -eq 0 ]; then
+    PASSED=$((PASSED + 1))
+    row "sitemap.xml" "sitemap" "PASS" "-" "field-discipline" \
+        "${sm_locs} <loc>, no ignored fields, no impossible dates"
+  else
+    FAILED=$((FAILED + 1))
+    row "sitemap.xml" "sitemap" "FAIL" "-" "field-discipline" \
+        "${sm_n} defect(s) in ${BASE}/sitemap.xml"
+    while IFS= read -r sm_d; do
+      [ -n "$sm_d" ] || continue
+      row "" "sitemap" "" "" "" "  $sm_d"
+      printf '%s\t%s\t%s\t%s\n' "sitemap.xml" "sitemap" "${BASE}/sitemap.xml" "$sm_d" >> "$FAILLOG"
+    done < "$sm_defects"
   fi
 fi
 
