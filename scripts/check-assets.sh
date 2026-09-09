@@ -152,6 +152,59 @@ looks_like_image_path() {
     | grep -qiE '\.(png|jpe?g|gif|svg|webp|avif|ico|bmp|apng)$'
 }
 
+# ------------------------------------------------------------- rendered-text check
+# Strip <style>/<script> bodies and all tags, leaving roughly what a human READS.
+# This exists because markup and reading are different things: the nav wordmark was
+# `Snap<span>OG</span>`, so `grep SnapOG` over the source or the served HTML returned
+# nothing for four cycles while every page displayed "SnapOG" — the name of a live
+# competitor — at the top left. Assertions about what a page SAYS have to run against
+# the text, not the tags.
+render_text() {
+  tr '\n\r\t' '   ' < "$1" \
+  | awk '{
+      s = $0; out = "";
+      # Drop <style>...</style> and <script>...</script> bodies, whichever comes
+      # first, repeatedly. Done with index() rather than a regex because BSD sed
+      # has no non-greedy match and a greedy .* eats the whole document — which is
+      # precisely what the first version of this function did, and why the page
+      # checks would all have passed on an empty string.
+      while (1) {
+        i = index(tolower(s), "<style"); j = index(tolower(s), "<script");
+        c = index(s, "<!--");
+        # HTML comments must go too. A regex cannot do it: gsub(/<[^>]*>/) stops at
+        # the first ">" inside the comment, so a comment mentioning any tag leaks its
+        # prose into "rendered text" — which happened on the very commit that added
+        # this function, and would make the brand assertion fire on a code comment.
+        k = 0; tag = "";
+        if (i > 0)                     { k = i; tag = "</style>" }
+        if (j > 0 && (k == 0 || j < k)) { k = j; tag = "</script>" }
+        if (c > 0 && (k == 0 || c < k)) { k = c; tag = "-->" }
+        if (k == 0) break;
+        out = out substr(s, 1, k - 1);
+        rest = substr(s, k);
+        e = index(tolower(rest), tag);
+        if (e == 0) { s = ""; break }        # unterminated: drop the remainder
+        s = substr(rest, e + length(tag));
+      }
+      out = out s;
+      # Tags are removed with NO separator. That is the whole point: an inline
+      # <span> adds no visual space, so "Snap<span>OG</span>" reads as one word
+      # "SnapOG" and must be found as one word. Joining with a space instead makes
+      # this check miss exactly the defect it was written for (verified: it did).
+      # The cost is that adjacent block text can fuse; for substring assertions
+      # that errs toward a false positive, which is loud and cheap to inspect,
+      # rather than a false negative, which is what we have been shipping.
+      gsub(/<[^>]*>/, "", out);
+      print out;
+    }'
+}
+
+# Strings that must never appear in rendered page text. Case-SENSITIVE on purpose:
+# the worker hostname is legitimately `snapog.aoadmin.workers.dev` and renaming it
+# would break the only public URL we have, so lowercase `snapog` is expected and
+# fine. It is the capitalised brand form that must be gone.
+FORBIDDEN_TEXT="SnapOG"
+
 # ------------------------------------------------------- doc (markdown) helpers
 # A doc URL that is deliberately not a real address: a shell variable the reader
 # substitutes, an angle-bracket placeholder, a localhost dev address. These must be
@@ -283,6 +336,31 @@ self_test() {
     st_fail=1
   fi
 
+  # ---- rendered-text self-test --------------------------------------------
+  # 4b. The exact markup that defeated four rename audits, plus a <style> block
+  #     to prove CSS is not mistaken for prose. The negative case matters just as
+  #     much: if render_text returned nothing, every page would "pass" forever.
+  st_html="$WORKDIR/selftest-brand.html"
+  printf '%s' '<html><head><style>.x{content:"OGForge"}</style></head><body><nav><a class="nav-logo" href="/">Snap<span>OG</span></a></nav><p>hello</p></body></html>' > "$st_html"
+  if render_text "$st_html" | grep -q 'SnapOG'; then
+    row "selftest" "text" "OK" "-" "rendered-text" "split-element 'Snap<span>OG</span>' -> correctly detected"
+  else
+    row "selftest" "text" "BAD" "-" "rendered-text" "split-element wordmark NOT detected — this check is decorative"
+    st_fail=1
+  fi
+  if render_text "$st_html" | grep -q 'hello'; then
+    row "selftest" "text" "OK" "-" "rendered-text" "body prose survives extraction (not always-empty)"
+  else
+    row "selftest" "text" "BAD" "-" "rendered-text" "render_text returned no prose — every page would pass vacuously"
+    st_fail=1
+  fi
+  if render_text "$st_html" | grep -q 'content:'; then
+    row "selftest" "text" "BAD" "-" "rendered-text" "CSS leaked into rendered text — will produce false positives"
+    st_fail=1
+  else
+    row "selftest" "text" "OK" "-" "rendered-text" "<style> body excluded from rendered text"
+  fi
+
   # ---- doc-scan self-test -------------------------------------------------
   # 5. End-to-end on a fixture, because a broken EXTRACTOR looks exactly like a
   #    clean site. The fixture reproduces the Cycle #20 defect: a markdown link
@@ -412,6 +490,20 @@ scan_page() {
     echo "WARNING: single-quoted src/href attributes present on this page."
     echo "         This parser only reads double-quoted attributes, so those are UNCHECKED."
   fi
+
+  # What the page SAYS, as opposed to what it is made of.
+  for bad in $FORBIDDEN_TEXT; do
+    TOTAL=$((TOTAL + 1))
+    if render_text "$body" | grep -q "$bad"; then
+      FAILED=$((FAILED + 1))
+      row "$label" "text" "FAIL" "-" "rendered-text" "forbidden string '${bad}' is visible on this page"
+      printf '%s\t%s\t%s\t%s\n' "$label" "text" "${BASE}${page_path}" \
+        "rendered text contains '${bad}'" >> "$FAILLOG"
+    else
+      PASSED=$((PASSED + 1))
+      row "$label" "text" "PASS" "-" "rendered-text" "no forbidden string '${bad}'"
+    fi
+  done
 
   flat="$WORKDIR/flat.html"
   tr '\n\r\t' '   ' < "$body" > "$flat"

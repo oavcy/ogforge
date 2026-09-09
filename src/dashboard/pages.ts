@@ -435,10 +435,19 @@ function layout(title: string, body: string, extraHead = ''): string {
 // fallback, so the link belongs in the nav rather than buried in a footer.
 const REPO_URL = 'https://github.com/oavcy/ogforge';
 
+// The wordmark is split across two elements, and that is why every page still read
+// "SnapOG" for four cycles after the commit titled "complete the rename". No single
+// token in this file was ever the string "SnapOG", so grep-based rename audits kept
+// coming back clean while the top-left of every page displayed the name of a live
+// competitor at snapog.dev. Same shape as the cross-line <img src> of Cycle #19: the
+// truth spanned two elements and the tool reads one at a time. check-assets.sh now
+// asserts against RENDERED TEXT rather than markup, which is the only version of this
+// check that can see it. This note is a // comment on purpose — as an HTML comment it
+// shipped an internal post-mortem to every visitor on every request.
 function nav(_activePath = '/'): string {
   return `
   <nav class="nav">
-    <a class="nav-logo" href="/">Snap<span>OG</span></a>
+    <a class="nav-logo" href="/">OG<span>Forge</span></a>
     <div class="nav-links">
       <a href="/#how-it-works">Docs</a>
       <a href="/#limits">Limits</a>
