@@ -150,6 +150,16 @@ PAGES='
 
 # ------------------------------------------------------------------- output state
 TOTAL=0; PASSED=0; FAILED=0; SKIPPED=0
+
+# Self-test row tally. Cycle #24's consensus quoted "57 self-test assertions" in
+# one paragraph and "39 assertions" in another; #25 found neither reproducible and
+# recorded that "the script prints no runtime assertion total". True — but the rows
+# were always countable with `grep -c '^selftest '`, which nobody ran. So the fix
+# is not a comment, it is a printed number plus a floor that fails when the
+# self-test silently stops emitting rows. A shrinking self-test is invisible
+# otherwise: every remaining row still says OK.
+ST_ROWS=0; ST_BAD=0
+ST_ROWS_MIN=59     # rows emitted on 2026-09-09 (Cycle #26). Raise only with a run.
 FAILLOG="$WORKDIR/failures.txt"
 : > "$FAILLOG"
 
@@ -162,6 +172,10 @@ EXTLOG="$WORKDIR/advisory.txt"
 : > "$EXTLOG"
 
 row() { # page kind verdict status ct url reason
+  if [ "$1" = "selftest" ]; then
+    ST_ROWS=$((ST_ROWS + 1))
+    [ "$3" = "BAD" ] && ST_BAD=$((ST_BAD + 1))
+  fi
   printf '%-14s %-6s %-4s %-4s %-26s %s%s\n' \
     "$1" "$2" "$3" "$4" "$5" "$6" "${7:+  <-- $7}"
 }
@@ -984,7 +998,24 @@ self_test() {
     st_fail=1
   fi
 
+  # Coverage floor. Every check above reports its own verdict; none of them can
+  # report that it did not run. If a future edit drops half the self-test, the
+  # remaining half still prints OK and the run still says PASSED. This is the
+  # only assertion in the file whose subject is the self-test's own size.
+  # Read the count BEFORE emitting the verdict row: the row goes through row(),
+  # which increments ST_ROWS, so a naive version reports a tally one higher than
+  # the number it just complained about. An assertion whose own output moves its
+  # subject is the house defect in miniature.
+  st_rows_measured="$ST_ROWS"
+  if [ "$st_rows_measured" -lt "$ST_ROWS_MIN" ]; then
+    row "selftest" "meta" "BAD" "$st_rows_measured" "coverage-floor" \
+      "self-test emitted ${st_rows_measured} rows, floor is ${ST_ROWS_MIN} — coverage was silently lost"
+    st_fail=1
+  fi
+
   hr
+  echo "SELF-TEST TALLY  rows: ${st_rows_measured}   bad: ${ST_BAD}   floor: ${ST_ROWS_MIN}"
+  echo "                 reproduce with: ./scripts/check-assets.sh | grep -c '^selftest '"
   if [ "$st_fail" -ne 0 ]; then
     echo "SELF-TEST FAILED. THIS CHECKER IS UNTRUSTWORTHY — do not read anything into"
     echo "its green results. Fix the checker (or the network path to ${BASE}) first."
