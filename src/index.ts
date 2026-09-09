@@ -11,6 +11,7 @@ import {
   dashboardPage,
   errorPage,
 } from './dashboard/pages';
+import { postmortemPage, POSTMORTEM_PATH } from './dashboard/postmortem';
 import type { ApiKey, Env, OGParams, Tier } from './types';
 import {
   MAX_KEYS_PER_EMAIL,
@@ -141,10 +142,102 @@ async function recordUsage(
   await db.batch(statements);
 }
 
+// Record that an off-site page sent us a visitor. See migrations/0003 for why this
+// exists: the company's done-condition for distribution was a GitHub traffic API
+// call, but the link being distributed points at this Worker, so that gauge could
+// read `[]` forever while the thing actually worked. A gate that cannot register
+// success is the same defect as one that cannot go red.
+//
+// Writes ONLY for a cross-origin Referer — direct hits, crawlers and internal
+// navigation store nothing, which both bounds the table and makes every row mean
+// exactly one thing. Host only; never the full referring URL.
+//
+// Deliberately fire-and-forget via waitUntil and wrapped in a catch: an
+// instrumentation failure must never turn a readable page into a 500. The read
+// side (GET /postmortem/hits) is where a problem would surface.
+function recordInboundHit(c: Context<{ Bindings: Env }>, path: string): void {
+  const referer = c.req.header('referer');
+  if (!referer) return;
+
+  let refHost: string;
+  try {
+    refHost = new URL(referer).host.toLowerCase();
+  } catch {
+    return; // malformed Referer — nothing meaningful to record
+  }
+  if (!refHost || refHost === new URL(c.req.url).host.toLowerCase()) return;
+
+  c.executionCtx.waitUntil(
+    c.env.DB.prepare(
+      'INSERT INTO inbound_hits (path, ref_host) VALUES (?, ?)'
+    )
+      .bind(path, refHost)
+      .run()
+      .then(() => undefined)
+      .catch(err => {
+        console.error('inbound_hits insert failed:', err);
+      })
+  );
+}
+
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
 // Landing page
-app.get('/', c => htmlResponse(landingPage(origin(c.req.url))));
+app.get('/', c => {
+  recordInboundHit(c, '/');
+  return htmlResponse(landingPage(origin(c.req.url)));
+});
+
+// ── Postmortem: a CI gate that certified a product it never tested ────────────
+// A published incident report, not a product surface. Nothing here is gated and
+// nothing is sold; it exists because it is the one thing this company has that is
+// both genuinely useful to strangers and entirely honest.
+app.get(POSTMORTEM_PATH, c => {
+  recordInboundHit(c, POSTMORTEM_PATH);
+  return htmlResponse(postmortemPage(origin(c.req.url)));
+});
+
+// Trailing-slash variant, so a link that picks up a slash somewhere between a
+// submission form and a reader's browser does not land on the 404 page.
+app.get(`${POSTMORTEM_PATH}/`, c => c.redirect(POSTMORTEM_PATH, 301));
+
+// The read side of the referrer instrument. Public and unauthenticated on purpose:
+// it is the evidence that a distribution attempt did or did not produce inbound
+// traffic, and evidence only we can read is worth less. Aggregate rows only —
+// referrer host and a count. No paths, no URLs, no visitor data of any kind.
+app.get('/postmortem/hits', async c => {
+  try {
+    const { results } = await c.env.DB.prepare(
+      `SELECT ref_host, COUNT(*) AS hits, MIN(day) AS first_day, MAX(day) AS last_day
+         FROM inbound_hits
+        GROUP BY ref_host
+        ORDER BY hits DESC
+        LIMIT 100`
+    ).all<{ ref_host: string; hits: number; first_day: string; last_day: string }>();
+
+    const rows = results ?? [];
+    return c.json({
+      ok: true,
+      // The whole point of the endpoint: is this list empty or not?
+      distinct_referrer_hosts: rows.length,
+      total_inbound_hits: rows.reduce((sum, r) => sum + r.hits, 0),
+      referrers: rows,
+      note:
+        'Cross-origin Referer hosts only. Direct traffic and same-origin navigation ' +
+        'are not recorded. Host only — no URLs, IPs, user agents or identifiers.',
+    });
+  } catch (err) {
+    // Report the failure instead of pretending the answer is zero. An instrument
+    // that returns an empty list when it is broken is indistinguishable from one
+    // reporting a true zero, and that ambiguity is the exact thing this postmortem
+    // is about.
+    console.error('/postmortem/hits failed:', err);
+    return c.json(
+      { ok: false, error: 'inbound_hits query failed', detail: String(err) },
+      500
+    );
+  }
+});
 
 // ── OG image generation ────────────────────────────────────────────────────────
 app.get('/og', async c => {
@@ -621,6 +714,9 @@ app.get('/robots.txt', c => {
     'Allow: /',
     'Disallow: /dashboard',
     'Disallow: /admin/',
+    // The postmortem page itself is very much indexable; only the JSON
+    // instrument beneath it is not a search result anyone wants.
+    'Disallow: /postmortem/hits',
     '',
     `Sitemap: ${site}/sitemap.xml`,
     '',
@@ -643,6 +739,7 @@ app.get('/sitemap.xml', c => {
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
   <url><loc>${site}/</loc><changefreq>weekly</changefreq><priority>1.0</priority></url>
   <url><loc>${site}/register</loc><changefreq>monthly</changefreq><priority>0.8</priority></url>
+  <url><loc>${site}${POSTMORTEM_PATH}</loc><changefreq>yearly</changefreq><priority>0.9</priority></url>
   <url><loc>${site}/brand.png</loc><changefreq>monthly</changefreq><priority>0.3</priority></url>
   <url><loc>${site}/demo.png</loc><changefreq>monthly</changefreq><priority>0.3</priority></url>
 </urlset>

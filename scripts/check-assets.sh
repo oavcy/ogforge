@@ -101,6 +101,8 @@ PAGES='
 /|^2[0-9][0-9]$
 /register|^2[0-9][0-9]$
 /dashboard|^2[0-9][0-9]$
+/postmortem/self-certifying-ci-gate|^2[0-9][0-9]$
+/postmortem/hits|^2[0-9][0-9]$
 /definitely-not-a-real-page-9f3a1c|^404$
 '
 
@@ -417,6 +419,59 @@ self_test() {
     row "selftest" "doc" "OK" "-" "placeholder" "real URL -> correctly NOT skipped"
   fi
 
+  # 8. Reference SHAPES the extractor was blind to until Cycle #22: single-quoted
+  #    attributes and CSS url(). Listed as "not yet covered" in consensus for
+  #    several cycles, which is a strictly worse state than not knowing — the gate
+  #    was reporting 34/34 while unable to see two legal ways to reference an asset.
+  #    Each shape gets a positive assertion AND the fixture carries two negative
+  #    controls, because an extractor that finds nothing is indistinguishable from
+  #    a clean page in the summary line.
+  st_sq=$(printf '\047')
+  st_tab=$(printf '\t')
+  st_shapes="$WORKDIR/selftest-shapes.html"
+  {
+    printf '%s' '<html><head><style>.hero{background:url("/definitely-missing-bg.png") no-repeat}'
+    printf '%s' '@font-face{src:url(/definitely-missing-font.woff2)}</style></head><body>'
+    printf 'a <img src=%s/definitely-missing-asset.png%s alt=%sx%s>' "$st_sq" "$st_sq" "$st_sq" "$st_sq"
+    printf 'b <div style="background-image:url(%s/definitely-missing-inline.png%s)"></div>' "$st_sq" "$st_sq"
+    printf 'c <p>it%ss fine</p>' "$st_sq"
+    printf '%s' '<img src="data:image/svg+xml;base64,AAAA"></body></html>'
+  } > "$st_shapes"
+  extract_refs "$st_shapes" > "$WORKDIR/selftest-shapes.refs"
+
+  for st_case in \
+    "image${st_tab}/definitely-missing-asset.png|single-quoted <img src='...'>" \
+    "image${st_tab}/definitely-missing-bg.png|CSS url(\"...\") in <style>" \
+    "asset${st_tab}/definitely-missing-font.woff2|unquoted CSS url(...) in @font-face" \
+    "image${st_tab}/definitely-missing-inline.png|CSS url('...') in inline style="
+  do
+    st_want=${st_case%%|*}; st_desc=${st_case#*|}
+    if grep -q "^${st_want}$" "$WORKDIR/selftest-shapes.refs"; then
+      row "selftest" "shape" "OK" "-" "extract" "$st_desc -> extracted"
+    else
+      row "selftest" "shape" "BAD" "-" "extract" "$st_desc NOT extracted — gate is blind to this shape"
+      st_fail=1
+    fi
+  done
+
+  # negative control A: an apostrophe in prose must not manufacture a reference.
+  # Without this, "fix the blindness" could be satisfied by matching far too much,
+  # and the gate would go permanently red on ordinary English.
+  if grep -q 'fine' "$WORKDIR/selftest-shapes.refs"; then
+    row "selftest" "shape" "BAD" "-" "extract" "prose apostrophe became a reference — extractor over-matches"
+    st_fail=1
+  else
+    row "selftest" "shape" "OK" "-" "extract" "prose apostrophe -> not a reference"
+  fi
+
+  # negative control B: an inlined data: URI must be skipped, not probed as a path.
+  if [ -z "$(normalize_url 'data:image/svg+xml;base64,AAAA')" ]; then
+    row "selftest" "shape" "OK" "-" "normalize" "data: URI -> correctly skipped"
+  else
+    row "selftest" "shape" "BAD" "-" "normalize" "data: URI treated as a path — would be a false failure"
+    st_fail=1
+  fi
+
   hr
   if [ "$st_fail" -ne 0 ]; then
     echo "SELF-TEST FAILED. THIS CHECKER IS UNTRUSTWORTHY — do not read anything into"
@@ -431,29 +486,54 @@ self_test() {
 # Extract references from one page's HTML into "<kind>\t<raw-url>" lines.
 extract_refs() {
   _flat="$1"
-  # <img src="..."> — the category that produced the 19-cycle defect. Tracked by
-  # tag, not by file extension, because /og?title=... has no extension at all.
-  grep -oE '<img[^>]*>' "$_flat" 2>/dev/null \
-    | grep -oE 'src="[^"]*"' | sed -e 's/^src="//' -e 's/"$//' \
-    | awk '{print "image\t" $0}'
-  # <link rel="icon"|"apple-touch-icon" href="...">
-  grep -oE '<link[^>]*>' "$_flat" 2>/dev/null | grep -iE 'rel="[^"]*icon' \
-    | grep -oE 'href="[^"]*"' | sed -e 's/^href="//' -e 's/"$//' \
-    | awk '{print "image\t" $0}'
-  # social unfurl images — these break silently and only in someone else's UI.
-  # Match the URL-bearing properties EXACTLY: og:image:width/height/alt and
-  # twitter:image:alt carry a number or prose, not a URL, and treating them as
-  # assets produces confident nonsense like "GET /1200 -> 404".
-  grep -oE '<meta[^>]*>' "$_flat" 2>/dev/null \
-    | grep -iE '(property|name)="(og:image(:(url|secure_url))?|twitter:image(:src)?)"' \
-    | grep -oE 'content="[^"]*"' | sed -e 's/^content="//' -e 's/"$//' \
-    | awk '{print "image\t" $0}'
-  # every other src= (script, iframe, source, video, audio)
-  grep -oE 'src="[^"]*"' "$_flat" 2>/dev/null | sed -e 's/^src="//' -e 's/"$//' \
-    | awk '{print "asset\t" $0}'
-  # every href= (stylesheets, routes, in-page nav)
-  grep -oE 'href="[^"]*"' "$_flat" 2>/dev/null | sed -e 's/^href="//' -e 's/"$//' \
-    | awk '{print "link\t" $0}'
+  # Both quote characters, every pass. HTML permits src='...' exactly as much as
+  # src="...", and for 22 cycles this extractor only knew the double-quoted form.
+  # That is the same defect class as the split-element wordmark: the reference was
+  # THERE, the gate simply could not see that shape of it, and an unseen reference
+  # is indistinguishable from a healthy one in the summary line.
+  _sq=$(printf '\047')
+  for _q in '"' "$_sq"; do
+    # <img src="..."> — the category that produced the 19-cycle defect. Tracked by
+    # tag, not by file extension, because /og?title=... has no extension at all.
+    grep -oE '<img[^>]*>' "$_flat" 2>/dev/null \
+      | grep -oE "src=${_q}[^${_q}]*${_q}" | sed -e "s/^src=${_q}//" -e "s/${_q}\$//" \
+      | awk '{print "image\t" $0}'
+    # <link rel="icon"|"apple-touch-icon" href="...">
+    grep -oE '<link[^>]*>' "$_flat" 2>/dev/null | grep -iE "rel=${_q}[^${_q}]*icon" \
+      | grep -oE "href=${_q}[^${_q}]*${_q}" | sed -e "s/^href=${_q}//" -e "s/${_q}\$//" \
+      | awk '{print "image\t" $0}'
+    # social unfurl images — these break silently and only in someone else's UI.
+    # Match the URL-bearing properties EXACTLY: og:image:width/height/alt and
+    # twitter:image:alt carry a number or prose, not a URL, and treating them as
+    # assets produces confident nonsense like "GET /1200 -> 404".
+    grep -oE '<meta[^>]*>' "$_flat" 2>/dev/null \
+      | grep -iE "(property|name)=${_q}(og:image(:(url|secure_url))?|twitter:image(:src)?)${_q}" \
+      | grep -oE "content=${_q}[^${_q}]*${_q}" | sed -e "s/^content=${_q}//" -e "s/${_q}\$//" \
+      | awk '{print "image\t" $0}'
+    # every other src= (script, iframe, source, video, audio)
+    grep -oE "src=${_q}[^${_q}]*${_q}" "$_flat" 2>/dev/null \
+      | sed -e "s/^src=${_q}//" -e "s/${_q}\$//" \
+      | awk '{print "asset\t" $0}'
+    # every href= (stylesheets, routes, in-page nav)
+    grep -oE "href=${_q}[^${_q}]*${_q}" "$_flat" 2>/dev/null \
+      | sed -e "s/^href=${_q}//" -e "s/${_q}\$//" \
+      | awk '{print "link\t" $0}'
+  done
+  # CSS url(...) — <style> blocks, inline style="", @font-face. A background image
+  # or webfont that 404s is invisible to every check above: the page still returns
+  # 200 and the missing thing is a blank area, which is exactly how /og shipped
+  # broken for 19 cycles. Quotes around the value are optional in CSS, so all three
+  # forms are handled. normalize_url() drops data: URIs, so inlined SVG is skipped
+  # rather than probed as a path.
+  grep -oE 'url\([^)]*\)' "$_flat" 2>/dev/null \
+    | sed -e 's/^url(//' -e 's/)$//' \
+          -e "s/^[\"${_sq}]//" -e "s/[\"${_sq}]\$//" \
+          -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+    | while IFS= read -r _u; do
+        [ -n "$_u" ] || continue
+        if looks_like_image_path "$_u"; then printf 'image\t%s\n' "$_u"
+        else printf 'asset\t%s\n' "$_u"; fi
+      done
 }
 
 scan_page() {

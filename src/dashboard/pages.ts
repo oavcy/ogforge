@@ -451,6 +451,7 @@ function nav(_activePath = '/'): string {
     <div class="nav-links">
       <a href="/#how-it-works">Docs</a>
       <a href="/#limits">Limits</a>
+      <a href="/postmortem/self-certifying-ci-gate">Postmortem</a>
       <a href="${REPO_URL}">Source</a>
       <a href="/register" class="btn btn-primary">Get API Key →</a>
     </div>
