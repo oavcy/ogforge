@@ -2,6 +2,13 @@
 
 Generate Open Graph images via API — Cloudflare Workers, cached on R2, sub-100ms on cache hit.
 
+<img src="https://snapog.aoadmin.workers.dev/demo.png" alt="An OG card rendered by OGForge: the tag ENGINEERING, the headline &quot;How We Cut Cold-Start Latency by 80%&quot;, a one-line description, and the footer myblog.dev" width="600" height="315">
+
+That image is not a mockup. GitHub fetched it from the live API a moment ago —
+`GET /demo.png`, through the same `buildElement` renderer a paid `/og` request goes
+through. If rendering breaks, this README shows a broken image, which is the point of
+putting it here rather than committing a screenshot.
+
 > Formerly **SnapOG**. Renamed because `snapog.dev` is a live, unrelated product with the
 > same name — the collision was ours to fix, not theirs. The Worker hostname below still
 > reads `snapog` and is staying that way: renaming it would break the only public URL we
@@ -243,7 +250,7 @@ npx wrangler deploy
 
 - [Cloudflare Workers](https://workers.cloudflare.com/) — edge compute
 - [Hono](https://hono.dev/) — HTTP framework
-- [workers-og](https://github.com/nicholasgasior/workers-og) — OG image generation (Satori-based)
+- [workers-og](https://github.com/kvnang/workers-og) — OG image generation (Satori-based)
 - [Cloudflare D1](https://developers.cloudflare.com/d1/) — SQLite for usage tracking
 - [Cloudflare R2](https://developers.cloudflare.com/r2/) — image cache storage
 

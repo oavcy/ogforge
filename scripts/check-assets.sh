@@ -15,6 +15,15 @@
 #     * the response is not 4xx/5xx
 #     * anything that is supposed to be an image actually has content-type: image/*
 #
+#   It ALSO checks markdown docs (README.md), because the repo front page is a
+#   published surface too and it was never covered. Cycle #20 found out how: the
+#   README credited our core renderer to `github.com/nicholasgasior/workers-og`,
+#   which is a 404 — an invented repo under a real person's account. Twenty cycles
+#   of reading that file did not catch it; one fetch did. Note the difference in
+#   scope from the HTML scan: on our own site an external link is somebody else's
+#   problem, but in a doc an EXTERNAL link is exactly the kind that rots, so the
+#   doc scan follows external hosts too.
+#
 # FALSIFIABILITY (company standing rule: a gate that cannot go red is not evidence)
 #   --self-test injects known-bad URLs and asserts this checker calls them FAIL,
 #   plus one known-good URL it must call PASS. If the self-test does not behave,
@@ -27,20 +36,26 @@
 #   BSD (macOS) sed/grep compatible. bash 3.2 compatible (no assoc arrays).
 #
 # USAGE
-#   ./scripts/check-assets.sh [BASE_URL] [--self-test] [--no-self-test] [--verbose]
+#   ./scripts/check-assets.sh [BASE_URL] [--self-test] [--no-self-test]
+#                             [--no-docs] [--docs-only] [--verbose]
 #
 # EXIT CODES
 #   0  everything passed
-#   1  at least one page or asset failed
+#   1  at least one page, asset or doc link failed
 #   2  the checker itself is untrustworthy (self-test misbehaved) or bad usage
 
 set -u
 
 DEFAULT_BASE="https://snapog.aoadmin.workers.dev"
 BASE=""
-MODE="full"        # full | selftest-only
+MODE="full"        # full | selftest-only | docs-only
 RUN_SELFTEST=1
+RUN_DOCS=1
 VERBOSE=0
+
+# Markdown files that are published to strangers. Paths are relative to the repo
+# root (the parent of scripts/), so the script works from any cwd.
+DOCS="${DOCS:-README.md}"
 
 # A real browser UA: we are reproducing what a HUMAN visitor sees, and some
 # origins vary behaviour by UA. Crucially we send NO credentials of any kind.
@@ -53,8 +68,10 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --self-test)    MODE="selftest-only" ;;
     --no-self-test) RUN_SELFTEST=0 ;;
+    --no-docs)      RUN_DOCS=0 ;;
+    --docs-only)    MODE="docs-only" ;;
     --verbose|-v)   VERBOSE=1 ;;
-    -h|--help)      sed -n '2,40p' "$0"; exit 0 ;;
+    -h|--help)      sed -n '2,50p' "$0"; exit 0 ;;
     -*)             echo "unknown flag: $1" >&2; exit 2 ;;
     *)              BASE="$1" ;;
   esac
@@ -66,6 +83,11 @@ BASE="${BASE%/}"                       # strip trailing slash
 BASE_HOST=$(printf '%s' "$BASE" | sed -e 's#^[a-zA-Z][a-zA-Z0-9+.-]*://##' -e 's#/.*$##')
 
 command -v curl >/dev/null 2>&1 || { echo "FATAL: curl not found" >&2; exit 2; }
+
+# Repo root = parent of scripts/. Resolved from $0 so DOCS paths hold from any cwd
+# (npm runs this from the package dir, a human may run it from anywhere).
+REPO_ROOT=$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)
+[ -n "$REPO_ROOT" ] || { echo "FATAL: cannot resolve repo root from $0" >&2; exit 2; }
 
 WORKDIR=$(mktemp -d 2>/dev/null || mktemp -d -t ogforge)
 trap 'rm -rf "$WORKDIR"' EXIT INT TERM
@@ -128,6 +150,31 @@ normalize_url() {
 looks_like_image_path() {
   printf '%s' "$1" | sed -e 's/?.*$//' \
     | grep -qiE '\.(png|jpe?g|gif|svg|webp|avif|ico|bmp|apng)$'
+}
+
+# ------------------------------------------------------- doc (markdown) helpers
+# A doc URL that is deliberately not a real address: a shell variable the reader
+# substitutes, an angle-bracket placeholder, a localhost dev address. These must be
+# SKIPPED — but reported, not swallowed. A gate that silently drops what it cannot
+# judge teaches you to trust a number that was never measured.
+is_placeholder() {
+  case "$1" in
+    *'$'*|*'<'*|*'>'*|*'YOUR_'*|*'your-worker'*|*'{'*|*'}'*) return 0 ;;
+    *'//127.0.0.1'*|*'//localhost'*|*'//0.0.0.0'*)           return 0 ;;
+  esac
+  return 1
+}
+
+# Unlike normalize_url (site scan), this KEEPS external hosts: in a doc, the
+# external link is the one that rots without anyone noticing.
+normalize_doc_url() {
+  raw=$(printf '%s' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/[.,;:]*$//')
+  [ -n "$raw" ] || { echo ""; return; }
+  case "$raw" in
+    '#'*|'mailto:'*|'tel:'*|'data:'*) echo ""; return ;;
+    http://*|https://*) echo "$raw"; return ;;
+    *) echo ""; return ;;   # relative repo paths: rendered by GitHub, not fetchable here
+  esac
 }
 
 # ------------------------------------------------------------------- the one probe
@@ -234,6 +281,62 @@ self_test() {
   else
     row "selftest" "link" "BAD" "$R_STATUS" "$R_CT" "/ -> checker said $R_VERDICT, expected PASS ($R_REASON)"
     st_fail=1
+  fi
+
+  # ---- doc-scan self-test -------------------------------------------------
+  # 5. End-to-end on a fixture, because a broken EXTRACTOR looks exactly like a
+  #    clean site. The fixture reproduces the Cycle #20 defect: a markdown link
+  #    to a GitHub repo path that does not exist. Extraction and probing are
+  #    asserted together — passing only one of them is how a gate goes quietly
+  #    blind on the very reference it was built to watch.
+  st_md="$WORKDIR/selftest-fixture.md"
+  {
+    printf '# fixture\n\n'
+    printf 'A credit to a repo that does not exist: '
+    printf '[workers-og](https://github.com/oavcy/ogforge-selftest-404-9f3a1c)\n\n'
+    printf 'A placeholder a reader substitutes: https://<your-worker>.workers.dev/og\n\n'
+    printf '![a card](%s/definitely-missing-asset.png)\n' "$BASE"
+  } > "$st_md"
+
+  st_bad_link="https://github.com/oavcy/ogforge-selftest-404-9f3a1c"
+  if extract_md_refs "$st_md" | grep -q "$st_bad_link"; then
+    row "selftest" "doc" "OK" "-" "extract" "markdown link target -> extracted"
+  else
+    row "selftest" "doc" "BAD" "-" "extract" "markdown link target NOT extracted — doc scan is blind"
+    st_fail=1
+  fi
+
+  probe_url link "$st_bad_link"
+  if [ "$R_VERDICT" = "FAIL" ]; then
+    row "selftest" "doc" "OK" "$R_STATUS" "$R_CT" "nonexistent GitHub repo -> correctly FAILed"
+  else
+    row "selftest" "doc" "BAD" "$R_STATUS" "$R_CT" "nonexistent repo -> checker said $R_VERDICT, expected FAIL"
+    st_fail=1
+  fi
+
+  # 6. A missing image referenced with markdown ![]() syntax must be extracted
+  #    AS AN IMAGE, not merely as a link.
+  if extract_md_refs "$st_md" | grep -q "^image$(printf '\t')${BASE}/definitely-missing-asset.png$"; then
+    row "selftest" "doc" "OK" "-" "extract" "![](...) -> classified image, not link"
+  else
+    row "selftest" "doc" "BAD" "-" "extract" "![](...) not classified as image — content-type check would be dropped"
+    st_fail=1
+  fi
+
+  # 7. The placeholder rule must skip what is not an address AND must not skip
+  #    what is. A gate that skips everything is green for the same reason a
+  #    healthy one is, and you cannot tell them apart from the summary line.
+  if is_placeholder 'https://<your-worker>.workers.dev/og'; then
+    row "selftest" "doc" "OK" "-" "placeholder" "<your-worker> -> correctly skipped"
+  else
+    row "selftest" "doc" "BAD" "-" "placeholder" "<your-worker> not skipped — gate will be permanently red"
+    st_fail=1
+  fi
+  if is_placeholder 'https://github.com/kvnang/workers-og'; then
+    row "selftest" "doc" "BAD" "-" "placeholder" "a real URL was classified placeholder — gate is silently blind"
+    st_fail=1
+  else
+    row "selftest" "doc" "OK" "-" "placeholder" "real URL -> correctly NOT skipped"
   fi
 
   hr
@@ -356,6 +459,76 @@ scan_page() {
   done < "$uniq_refs"
 }
 
+# ----------------------------------------------------------------- doc link scan
+# Emits "<kind>\t<raw-url>". Images come from markdown image syntax and <img src>;
+# every other URL is swept in bulk, which picks up markdown link targets, autolinks
+# and URLs inside fenced code blocks in one pass. Overlap between the two passes is
+# fine and in fact wanted — the rank-based dedupe below keeps the STRICTER kind.
+extract_md_refs() {
+  _f="$1"
+  grep -oE '!\[[^]]*\]\([^) ]+' "$_f" 2>/dev/null | sed -e 's/^.*(//' \
+    | awk '{print "image\t" $0}'
+  grep -oE '<img[^>]*>' "$_f" 2>/dev/null \
+    | grep -oE 'src="[^"]*"' | sed -e 's/^src="//' -e 's/"$//' \
+    | awk '{print "image\t" $0}'
+  grep -oE 'https?://[^ )>"'"'"'`]+' "$_f" 2>/dev/null \
+    | awk '{print "link\t" $0}'
+}
+
+scan_doc() {
+  doc="$1"
+  label=$(basename "$doc" | cut -c1-14)
+
+  echo
+  echo "DOC ${doc}"
+  hr
+  if [ ! -f "$doc" ]; then
+    TOTAL=$((TOTAL + 1)); FAILED=$((FAILED + 1))
+    row "$label" "doc" "FAIL" "-" "-" "$doc" "file not found"
+    printf '%s\t%s\t%s\t%s\n' "$label" "doc" "$doc" "file not found" >> "$FAILLOG"
+    return
+  fi
+
+  refs="$WORKDIR/mdrefs.txt"
+  extract_md_refs "$doc" > "$refs"
+
+  resolved="$WORKDIR/mdresolved.txt"
+  : > "$resolved"
+  while IFS="$(printf '\t')" read -r kind raw; do
+    [ -n "${raw:-}" ] || continue
+    if is_placeholder "$raw"; then
+      SKIPPED=$((SKIPPED + 1))
+      row "$label" "$kind" "SKIP" "-" "placeholder" "$raw"
+      continue
+    fi
+    abs=$(normalize_doc_url "$raw")
+    if [ -z "$abs" ]; then
+      SKIPPED=$((SKIPPED + 1))
+      [ "$VERBOSE" -eq 1 ] && row "$label" "$kind" "SKIP" "-" "relative/anchor" "$raw"
+      continue
+    fi
+    if [ "$kind" != "image" ] && looks_like_image_path "$abs"; then kind="image"; fi
+    case "$kind" in
+      image) rank=0 ;;
+      asset) rank=1 ;;
+      *)     rank=2 ;;
+    esac
+    printf '%s\t%s\t%s\n' "$rank" "$kind" "$abs" >> "$resolved"
+  done < "$refs"
+
+  uniq_refs="$WORKDIR/mduniq.txt"
+  sort -u "$resolved" | sort -t"$(printf '\t')" -k3,3 -k1,1n \
+    | awk -F'\t' '!seen[$3]++ {print $2 "\t" $3}' > "$uniq_refs"
+
+  n=$(wc -l < "$uniq_refs" | tr -d ' ')
+  if [ "$n" = "0" ]; then echo "(no fetchable URLs in this doc)"; return; fi
+  echo "${n} distinct URL(s), external included:"
+  while IFS="$(printf '\t')" read -r kind abs; do
+    [ -n "${abs:-}" ] || continue
+    check_and_report "$label" "$kind" "$abs"
+  done < "$uniq_refs"
+}
+
 # ------------------------------------------------------------------------- main
 echo "===================================================================================================="
 echo " OGForge anonymous asset check"
@@ -380,15 +553,26 @@ fi
 printf '\n%s\n' "===================================================================================================="
 printf '%-14s %-6s %-4s %-4s %-26s %s\n' "PAGE" "KIND" "RES" "HTTP" "CONTENT-TYPE" "URL"
 
-echo "$PAGES" | grep -v '^[[:space:]]*$' > "$WORKDIR/pages.txt"
-while IFS='|' read -r p exp; do
-  [ -n "${p:-}" ] || continue
-  scan_page "$p" "$exp"
-done < "$WORKDIR/pages.txt"
+if [ "$MODE" != "docs-only" ]; then
+  echo "$PAGES" | grep -v '^[[:space:]]*$' > "$WORKDIR/pages.txt"
+  while IFS='|' read -r p exp; do
+    [ -n "${p:-}" ] || continue
+    scan_page "$p" "$exp"
+  done < "$WORKDIR/pages.txt"
+fi
+
+if [ "$RUN_DOCS" -eq 1 ]; then
+  for d in $DOCS; do
+    case "$d" in
+      /*) scan_doc "$d" ;;
+      *)  scan_doc "${REPO_ROOT}/${d}" ;;
+    esac
+  done
+fi
 
 echo
 echo "===================================================================================================="
-echo "SUMMARY   checks: ${TOTAL}   passed: ${PASSED}   failed: ${FAILED}   skipped(external/anchor): ${SKIPPED}"
+echo "SUMMARY   checks: ${TOTAL}   passed: ${PASSED}   failed: ${FAILED}   skipped(external/anchor/placeholder): ${SKIPPED}"
 echo "===================================================================================================="
 if [ "$FAILED" -ne 0 ]; then
   echo
