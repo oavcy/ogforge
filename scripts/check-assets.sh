@@ -507,6 +507,151 @@ retry_semantics_defects() { # headers-file  condition(transient|permanent)
   return 0
 }
 
+# ---------------------------------- method semantics (#57)
+# #56 asked whether a status code was true. #57 asks the same question one rung
+# lower, of the code this service reaches for when it does not know what else to
+# say. Fetched this cycle from rfc-editor.org (200, 502,941 B, redirects=0), and
+# per #56 A2 the SECTION NUMBERS were verified to exist before being quoted —
+# §15.5.5 at line 7587, §15.5.6 at line 7601, §10.2.1 at line 4710, §9.1 at 3728:
+#
+#   "The 404 (Not Found) status code indicates that the origin server did not
+#    find a current representation for the target resource or is not willing to
+#    disclose that one exists."                          -- RFC 9110 §15.5.5
+#   "The 405 (Method Not Allowed) status code indicates that the method received
+#    in the request-line is known by the origin server but not supported by the
+#    target resource. The origin server MUST generate an Allow header field in a
+#    405 response containing a list of the target resource's currently supported
+#    methods."                                           -- RFC 9110 §15.5.6
+#   "An origin server MUST generate an Allow header field in a 405 (Method Not
+#    Allowed) response"                                  -- RFC 9110 §10.2.1
+#   "All general-purpose servers MUST support the methods GET and HEAD. All
+#    other methods are OPTIONAL."                        -- RFC 9110 §9.1
+#
+# Measured before the fix: POST/PUT/DELETE/PATCH/OPTIONS on `/` all returned 404
+# with no Allow header, as did POST to /health, /robots.txt, /sitemap.xml,
+# /dashboard, /postmortem/hits and /favicon.svg. `/` has a current representation
+# (GET / -> 200, 33,473 B) and we are demonstrably willing to disclose it: it is
+# the front door, one of the five <loc> entries in our own sitemap.xml, and its
+# canonical link names it. So the 404 failed BOTH disjuncts of §15.5.5.
+#
+# Cycle #55 examined this same behaviour and recorded it CLEAN, on the reasoning
+# that since we return 404 the "405 MUST send Allow" never applies. True, and
+# backwards. The MUST did not apply because the code was wrong. A false status
+# code does not discharge the obligations of the true one by displacing it —
+# that is the general form of the trap, and it is why "no MUST applies here" is
+# a conclusion that has to be earned rather than observed.
+#
+# THE EXCEPTION THAT WAS ARGUED OUT, recorded because the reasoning is the
+# valuable part. The first draft carved out /admin/upgrade — a live secret-gated
+# operator endpoint — so it would keep its 404 under §15.5.5's second disjunct
+# instead of answering `405 Allow: POST` and publishing its own location. That
+# was vetoed on a measurement the draft had already made and misread:
+#
+#   POST /admin/upgrade      -> 403  application/json          21 B
+#   POST /admin/nonexistent  -> 404  text/html; charset=utf-8  15,868 B
+#
+# The path is ALREADY an existence oracle to anyone sending POST, which is what
+# scanners send. The carve-out hid it from GET only, and in doing so made its own
+# 404 a NEW false status code under the clause cited to justify it: §15.5.5's
+# second disjunct requires that we are "not willing to disclose that one exists",
+# and we disclose it on POST. It would have removed fifteen false 404s and
+# manufactured a sixteenth WITH A CITATION ATTACHED — which is worse, because a
+# cited falsehood survives review and an uncited one does not.
+#
+# So this predicate has two expectations, not three, and no path-specific
+# exceptions of any kind. One rule. An exception list here would also have been
+# a hand-maintained table thirty lines below a comment rejecting hand-maintained
+# tables.
+method_semantics_defects() { # headers-file  request-method  expectation(disclosed|absent)
+  _mf="$1"; _mmeth="$2"; _mexp="$3"
+  # An unfetched response makes every verdict below vacuous (#41). Report and
+  # fail; never let a dead fetch read as a pass.
+  [ -s "$_mf" ] || { echo "UNREADABLE: no response headers captured"; return 0; }
+
+  _mst=$(grep -i '^HTTP/' "$_mf" 2>/dev/null | tail -1 | tr -d '\r' | awk '{print $2}')
+  [ -n "$_mst" ] || { echo "UNREADABLE: no status line in captured headers"; return 0; }
+
+  # Read the count on its own line, then head -1: `grep -c` PRINTS 0 and EXITS 1
+  # on no match, so `n=$(grep -c … || echo 0)` captures "0\n0" (#54, in the wild).
+  _mac=$(grep -ci '^Allow:' "$_mf" 2>/dev/null | head -1); _mac=${_mac:-0}
+  _mal=$(grep -i '^Allow:' "$_mf" 2>/dev/null | head -1 | tr -d '\r' \
+         | sed -e 's/^[Aa]llow:[[:space:]]*//' -e 's/[[:space:]]*$//')
+
+  case "$_mexp" in
+    disclosed)
+      if [ "$_mst" != "405" ]; then
+        echo "STATUS-LIE: got ${_mst} for ${_mmeth} on a resource we publish; 404 claims no representation exists or that we will not disclose one, and both are false of a path in our own sitemap (RFC 9110 §15.5.5 vs §15.5.6)"
+        return 0
+      fi
+      # The MUST. Not decoration: without it a 405 names no way forward at all.
+      if [ "$_mac" -eq 0 ]; then
+        echo "MISSING-ALLOW: 405 without an Allow header — RFC 9110 §15.5.6 and §10.2.1 both make this a MUST"
+        return 0
+      fi
+      [ "$_mac" -eq 1 ] || \
+        echo "DUPLICATE-ALLOW: ${_mac} Allow headers; a recipient may combine them, so send one list"
+      # An empty value is legal per §10.2.1 ("the resource allows no methods")
+      # but is false here — we only reach this branch for a registered route.
+      [ -n "$_mal" ] || \
+        echo "EMPTY-ALLOW: §10.2.1 reads an empty Allow as 'this resource allows no methods', which is false of a registered route"
+      # Normalise ONCE into a comma-delimited, space-free, comma-fenced form so
+      # the membership tests below are exact rather than substring-lucky: a bare
+      # `*GET*` would match "TARGET" and `*HEAD*` would match "OVERHEAD".
+      _mnorm=",$(printf '%s' "$_mal" | tr -d ' ' | tr -d '\r'),"
+      # THE SELF-CONTRADICTION ROW. A 405 that lists the very method it just
+      # refused tells the client to do again exactly what failed — #56 A1's rule
+      # (a code inviting a retry that cannot succeed is a lie) reaching a header.
+      case "$_mnorm" in
+        *",${_mmeth},"*)
+          echo "ALLOW-CONTRADICTS-STATUS: refused ${_mmeth} with 405 yet Allow lists ${_mmeth}" ;;
+      esac
+      # §9.1 makes HEAD support mandatory, and Hono really does answer HEAD from
+      # a GET handler (measured: HEAD / -> 200). Advertising GET without HEAD
+      # understates what the resource serves.
+      case "$_mnorm" in
+        *",GET,"*)
+          case "$_mnorm" in
+            *",HEAD,"*) ;;
+            *) echo "ALLOW-OMITS-HEAD: lists GET but not HEAD, though the server answers HEAD and RFC 9110 §9.1 makes it mandatory" ;;
+          esac ;;
+      esac
+      # Allow = #method, a comma-separated list of tokens. Reject a value that
+      # is not that shape — e.g. a bare string, or a list joined with something
+      # a parser will not split on.
+      case "$_mal" in
+        *[!A-Za-z0-9,\ -]*)
+          echo "MALFORMED-ALLOW: '${_mal}' is not the '#method' comma-separated token list of RFC 9110 §10.2.1" ;;
+      esac
+      # EVERY TOKEN MUST BE AN ACTUAL METHOD. This row exists because of a real
+      # bug in this cycle's first draft: it filtered `route.path.includes('*')`
+      # to drop middleware, which is a test of the path string rather than of
+      # method-agnosticism, so the first `app.use('/dashboard', mw)` anyone adds
+      # (measured: registers as method ALL, path /dashboard, NO star) would have
+      # emitted `Allow: ALL, GET, HEAD`. `ALL` is a well-formed token, so the
+      # syntax check above passes it, every client parses it, nothing errors, and
+      # the header is a lie. Only an is-it-really-a-method check catches that.
+      for _mtok in $(printf '%s' "$_mal" | tr ',' ' '); do
+        case "$_mtok" in
+          GET|HEAD|POST|PUT|DELETE|PATCH|OPTIONS|TRACE|CONNECT) ;;
+          *) echo "NOT-A-METHOD: Allow lists '${_mtok}', which is not an HTTP method — a framework's internal wildcard marker reaching the wire is the usual cause" ;;
+        esac
+      done
+      ;;
+
+    absent)
+      # The control. If everything became a 405 this row is what notices.
+      if [ "$_mst" != "404" ]; then
+        echo "STATUS: got ${_mst} for ${_mmeth} on a path with no registered route; 404 is the true code (RFC 9110 §15.5.5, first disjunct)"
+      fi
+      [ "$_mac" -eq 0 ] || \
+        echo "STRAY-ALLOW: Allow: ${_mal} on a path that has no resource to allow methods on"
+      ;;
+
+    *) echo "UNREADABLE: unknown expectation '${_mexp}'" ;;
+  esac
+  return 0
+}
+
 # ------------------------------------------------------------------- URL helpers
 # Normalize a raw attribute value to an absolute URL on BASE, or emit nothing if
 # the reference is out of scope (external host, anchor, mailto:, data:, ...).
@@ -1563,6 +1708,73 @@ self_test() {
     fi
   done
 
+  # 16e. METHOD SEMANTICS (#57). Fifteen fixtures through the same predicate the
+  #      live check uses. Unlike #56, this cycle's fix IS anonymously reachable,
+  #      so the live rows below can genuinely go red — these fixtures are not
+  #      carrying the falsifiability on their own, they are pinning the branches
+  #      production cannot reach (the undisclosed carve-out is exercised live,
+  #      but the malformed-Allow shapes are not).
+  st_mmdir="$WORKDIR/selftest-method"; mkdir -p "$st_mmdir"
+
+  # --- verbatim captures, local workerd, PRE-fix source (what we served for 56
+  #     cycles). Every one of these was 404 with zero Allow headers. ---
+  printf 'HTTP/1.1 404 Not Found\r\nContent-Type: text/html; charset=utf-8\r\n\r\n' \
+    > "$st_mmdir/pre57-post-root.txt"
+  printf 'HTTP/1.1 404 Not Found\r\nContent-Type: text/html; charset=utf-8\r\n\r\n' \
+    > "$st_mmdir/pre57-options-root.txt"
+  # --- verbatim captures, same runtime, POST-fix source ---
+  printf 'HTTP/1.1 405 Method Not Allowed\r\nContent-Type: text/html; charset=utf-8\r\nAllow: GET, HEAD\r\n\r\n' \
+    > "$st_mmdir/good-405-get.txt"
+  printf 'HTTP/1.1 405 Method Not Allowed\r\nContent-Type: text/html; charset=utf-8\r\nAllow: GET, HEAD, POST\r\n\r\n' \
+    > "$st_mmdir/good-405-getpost.txt"
+  printf 'HTTP/1.1 405 Method Not Allowed\r\nContent-Type: text/html; charset=utf-8\r\nAllow: POST\r\n\r\n' \
+    > "$st_mmdir/good-405-postonly.txt"
+  printf 'HTTP/1.1 404 Not Found\r\nContent-Type: text/html; charset=utf-8\r\n\r\n' \
+    > "$st_mmdir/good-absent.txt"
+  # --- synthetic: each isolates one clause ---
+  printf 'HTTP/1.1 405 Method Not Allowed\r\n\r\n' > "$st_mmdir/no-allow.txt"
+  printf 'HTTP/1.1 405 Method Not Allowed\r\nAllow: \r\n\r\n' > "$st_mmdir/empty-allow.txt"
+  printf 'HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD, POST\r\n\r\n' \
+    > "$st_mmdir/contradicts.txt"
+  printf 'HTTP/1.1 405 Method Not Allowed\r\nAllow: GET\r\n\r\n' > "$st_mmdir/omits-head.txt"
+  printf 'HTTP/1.1 405 Method Not Allowed\r\nAllow: GET; HEAD\r\n\r\n' > "$st_mmdir/malformed.txt"
+  printf 'HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD\r\nAllow: POST\r\n\r\n' \
+    > "$st_mmdir/duplicate.txt"
+  printf 'HTTP/1.1 405 Method Not Allowed\r\nAllow: ALL, GET, HEAD\r\n\r\n' > "$st_mmdir/all-token.txt"
+  printf 'HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD\r\n\r\n' > "$st_mmdir/overreach.txt"
+  : > "$st_mmdir/unfetchable.txt"
+
+  for st_case in \
+    "1|pre57-post-root.txt|POST|disclosed|the 404 POST / served until #57 — the status lie itself" \
+    "1|pre57-options-root.txt|OPTIONS|disclosed|the 404 OPTIONS / served until #57" \
+    "0|good-405-get.txt|POST|disclosed|post-fix 405 on a GET-only path must be clean" \
+    "0|good-405-getpost.txt|PUT|disclosed|post-fix 405 on a GET+POST path must be clean" \
+    "0|good-405-postonly.txt|GET|disclosed|post-fix 405 on the POST-only operator path must be clean" \
+    "0|good-absent.txt|POST|absent|a genuinely absent path must still read 404, or the fix over-fired" \
+    "1|no-allow.txt|POST|disclosed|405 without Allow is rejected (§15.5.6 and §10.2.1 MUST)" \
+    "1|empty-allow.txt|POST|disclosed|an empty Allow claims the resource allows no methods" \
+    "1|contradicts.txt|POST|disclosed|a 405 whose Allow lists the refused method is rejected" \
+    "1|omits-head.txt|POST|disclosed|Allow: GET without HEAD is rejected (§9.1)" \
+    "2|malformed.txt|POST|disclosed|a semicolon-joined Allow is rejected twice: bad syntax, and 'GET;' is not a method" \
+    "1|duplicate.txt|PUT|disclosed|two Allow headers are rejected — send one list" \
+    "1|all-token.txt|POST|disclosed|Allow: ALL is rejected — the exact header the vetoed path filter would have served" \
+    "2|overreach.txt|POST|absent|a 405 on a path with no route is rejected: status and stray Allow" \
+    "1|unfetchable.txt|POST|disclosed|an uncaptured response reports UNREADABLE, never a pass"
+  do
+    st_want=${st_case%%|*}; st_rest=${st_case#*|}
+    st_file=${st_rest%%|*}; st_rest=${st_rest#*|}
+    st_mth=${st_rest%%|*};  st_rest=${st_rest#*|}
+    st_exp=${st_rest%%|*};  st_desc=${st_rest#*|}
+    st_got=$(method_semantics_defects "$st_mmdir/$st_file" "$st_mth" "$st_exp" | grep -c . | head -1)
+    if [ "$st_got" = "$st_want" ]; then
+      row "selftest" "method" "OK" "$st_got" "semantics" "$st_desc"
+    else
+      row "selftest" "method" "BAD" "$st_got" "semantics" \
+          "$st_desc — got ${st_got} defect(s), wanted ${st_want}"
+      st_fail=1
+    fi
+  done
+
   # 17. THE EXIT CODE ITSELF. Every assertion above tests a pure function; none of
   #     them would notice if the exit-code block were deleted. That block is the
   #     one thing this design cites as making the external class falsifiable
@@ -2419,6 +2631,67 @@ if [ "$MODE" != "docs-only" ]; then
         row "" "retry" "" "" "" "  $rt_d"
         printf '%s\t%s\t%s\t%s\n' "$rt_path" "retry" "${BASE}${rt_path}" "$rt_d" >> "$FAILLOG"
       done < "$rt_defects"
+    fi
+  done
+fi
+
+# ---- live method semantics (#57) ---------------------------------------------
+# WHAT THIS SECTION CAN DO THAT #56's COULD NOT: go red against live production.
+# #56's two fixed branches needed a credential no anonymous prober has, so its
+# live rows could only assert a contrapositive and its falsifiability rested on
+# captured fixtures. This cycle's fix is reachable by anyone with curl. Every
+# `disclosed` row below returned 404-with-no-Allow from production before this
+# cycle's deploy and returns 405-with-Allow after it, so each one is a real
+# before/after measurement rather than an inference.
+#
+# The last row is the over-fire control, and it catches the most likely way this
+# change goes wrong: a fix that turns EVERYTHING into a 405 would still make
+# every row above it green. `absent` pins that a path with no route at all still
+# tells the truth — a change that broke it would be invisible to the rows above.
+if [ "$MODE" != "docs-only" ]; then
+  echo
+  echo "METHOD SEMANTICS   (RFC 9110 §15.5.5 · §15.5.6 MUST · §10.2.1 MUST · §9.1)"
+  hr
+  for mm_case in \
+    "/|POST|disclosed|the front door, in our own sitemap" \
+    "/|OPTIONS|disclosed|a method we do not implement; 405+Allow is the honest answer (§9.1)" \
+    "/health|PUT|disclosed|liveness" \
+    "/sitemap.xml|POST|disclosed|a published document" \
+    "/register|PUT|disclosed|a GET+POST path — Allow must list both" \
+    "/admin/upgrade|GET|disclosed|the POST-only operator path — one rule, no exceptions" \
+    "/ogforge-gate-no-such-path|POST|absent|over-fire control: no route, so 404 is TRUE"
+  do
+    mm_path=${mm_case%%|*}; mm_rest=${mm_case#*|}
+    mm_meth=${mm_rest%%|*}; mm_rest=${mm_rest#*|}
+    mm_exp=${mm_rest%%|*};  mm_desc=${mm_rest#*|}
+    mm_file="$WORKDIR/method-$(printf '%s' "${mm_meth}${mm_path}" | tr -c 'A-Za-z0-9' '-').hdr"
+    # -X on its own sends the method with no body and does not follow redirects.
+    # NEVER add -L here: #39: -w/-D would then describe whatever answered last.
+    curl -sS --compressed --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" \
+         -A "$UA" -X "$mm_meth" -D "$mm_file" -o /dev/null "${BASE}${mm_path}" 2>/dev/null || :
+    mm_defects="$WORKDIR/method-defects-$$.txt"
+    method_semantics_defects "$mm_file" "$mm_meth" "$mm_exp" > "$mm_defects"
+    mm_st=$(grep -i '^HTTP/' "$mm_file" 2>/dev/null | tail -1 | tr -d '\r' | awk '{print $2}')
+    # Count on its own line, then head -1 (#54: `grep -c` prints 0 AND exits 1).
+    mm_n=$(grep -c . "$mm_defects" 2>/dev/null | head -1)
+    mm_n=${mm_n:-0}
+    TOTAL=$((TOTAL + 1))
+    if [ "$mm_n" -eq 0 ]; then
+      PASSED=$((PASSED + 1))
+      # Print the Allow value beside the verdict so the two can contradict each
+      # other in the transcript (#54 A4) rather than the verdict standing alone.
+      mm_al=$(grep -i '^Allow:' "$mm_file" 2>/dev/null | head -1 | tr -d '\r' \
+              | sed -e 's/^[Aa]llow:[[:space:]]*//')
+      row "$mm_meth $mm_path" "method" "PASS" "${mm_st:-?}" "semantics" \
+          "${mm_desc} — Allow: [${mm_al:-none}]"
+    else
+      FAILED=$((FAILED + 1))
+      row "$mm_meth $mm_path" "method" "FAIL" "${mm_st:-?}" "semantics" "${mm_desc} — ${mm_n} defect(s)"
+      while IFS= read -r mm_d; do
+        [ -n "$mm_d" ] || continue
+        row "" "method" "" "" "" "  $mm_d"
+        printf '%s\t%s\t%s\t%s\n' "$mm_path" "method" "${BASE}${mm_path}" "$mm_d" >> "$FAILLOG"
+      done < "$mm_defects"
     fi
   done
 fi

@@ -1164,8 +1164,132 @@ app.get('/sitemap.xml', c => {
 
 app.get('/health', c => c.json({ ok: true, ts: new Date().toISOString() }));
 
-// 404 fallback
-app.notFound(_c => htmlResponse(errorPage(404, 'Page not found'), 404));
+// ── Cycle #57: is the STATUS CODE true? ───────────────────────────────────────
+// For 56 cycles `POST /` returned 404. Measured this cycle, before the fix:
+// POST/PUT/DELETE/PATCH/OPTIONS on `/` → 404 with no Allow header, and the same
+// for POST to /health, /robots.txt, /sitemap.xml, /dashboard, /postmortem/hits
+// and /favicon.svg. RFC 9110 §15.5.5 (fetched, 502,941 B; section verified to
+// exist at line 7587 — #56 A2):
+//
+//   "The 404 (Not Found) status code indicates that the origin server did not
+//    find a current representation for the target resource or is not willing to
+//    disclose that one exists."
+//
+// `/` HAS a current representation (GET / → 200, 33,473 B) and we are plainly
+// WILLING to disclose it: it is the front door, it is one of the five <loc>
+// entries in our own public sitemap.xml, and its canonical link names it. The
+// 404 failed BOTH disjuncts. The true code is §15.5.6:
+//
+//   "The 405 (Method Not Allowed) status code indicates that the method received
+//    in the request-line is known by the origin server but not supported by the
+//    target resource. The origin server MUST generate an Allow header field in a
+//    405 response containing a list of the target resource's currently supported
+//    methods."
+//
+// Cycle #55 looked at this same behaviour and recorded it clean, reasoning that
+// since we return 404 the "405 MUST send Allow" never applies. That is true and
+// backwards: the MUST did not apply BECAUSE the code was wrong. A false status
+// code cannot discharge the obligations of the true one by displacing it.
+//
+// The allowed-method set is derived from Hono's own `app.routes` — the array the
+// route registrations above populate as a side effect of registering — and never
+// from a hand-kept table, which would be a second source of truth free to drift
+// (#43: a comment is not an implementation).
+//
+// THE FILTER IS ON THE METHOD, NOT THE PATH, and that distinction is the whole
+// correctness of this block. The first draft skipped `route.path.includes('*')`,
+// reasoning that `app.use('*', …)` is middleware. That tests "does the path
+// string contain an asterisk" while claiming to test "is this middleware", and
+// the two coincide only because our single `app.use` happens to be written with
+// a star. Measured in this repo's Hono 4.12.12:
+//
+//   app.use('/dashboard', mw)  ->  { method: 'ALL', path: '/dashboard' }   <- no star
+//   app.use('/dash/*', mw)     ->  { method: 'ALL', path: '/dash/*' }
+//
+// So the first path-scoped middleware anyone adds — `app.use('/dashboard',
+// requireAuth)` is the obvious next commit — would have put ALL into the set and
+// served `Allow: ALL, GET, HEAD`. `ALL` is not an HTTP method, but it is a valid
+// token, so every client would have parsed it and no test would have failed.
+// A method-agnostic registration says nothing about which methods a resource
+// supports; that is the real property, so that is what is filtered on.
+//
+// BOUND (what this does NOT do): matching is exact string equality on the
+// registered path. Every one of our 16 paths is static — no `:param`, no regex —
+// so this is exact today. If a future route uses a pattern, it will not match
+// here and that request falls through to 404, i.e. it degrades to the behaviour
+// this comment is replacing rather than to something new.
+//
+// Computed lazily on first miss rather than at module scope, so its correctness
+// does not depend on this block's line position in the file. A module-scope IIFE
+// snapshots `app.routes` as it stands at that line, and a route registered below
+// it would have been silently absent from every Allow header.
+let allowedMethods: Map<string, string> | null = null;
+function allowedMethodsFor(path: string): string | undefined {
+  if (!allowedMethods) {
+    const byPath = new Map<string, Set<string>>();
+    for (const route of app.routes) {
+      if (route.method.toUpperCase() === 'ALL') continue;
+      const methods = byPath.get(route.path) ?? new Set<string>();
+      methods.add(route.method.toUpperCase());
+      byPath.set(route.path, methods);
+    }
+    allowedMethods = new Map<string, string>();
+    for (const [p, methods] of byPath) {
+      // HEAD is never in `app.routes` — Hono synthesizes it at dispatch, not at
+      // registration: `node_modules/hono/dist/hono-base.js:273` rewrites a HEAD
+      // request into a GET and returns the result with a null body. So the
+      // source of truth for Allow is `app.routes` PLUS that one rule, and saying
+      // "app.routes is the single source of truth" would have been false.
+      // Confirmed by measurement too (HEAD / → 200), and RFC 9110 §9.1 line 3794
+      // makes HEAD support mandatory regardless.
+      if (methods.has('GET')) methods.add('HEAD');
+      allowedMethods.set(p, [...methods].sort().join(', '));
+    }
+  }
+  return allowedMethods.get(path);
+}
+
+// ONE RULE, NO EXCEPTIONS — and the exception is what had to be argued out.
+// The first draft carved out /admin/upgrade, a live secret-gated operator
+// endpoint, so it would keep its 404 under §15.5.5's second disjunct rather than
+// answer `405 Allow: POST` and publish its own location. That was vetoed, on a
+// measurement the draft had already made and misread. Live, right now:
+//
+//   POST /admin/upgrade      -> 403  application/json          21 B
+//   POST /admin/nonexistent  -> 404  text/html; charset=utf-8  15,868 B
+//   POST /no-such-page       -> 404  text/html; charset=utf-8  15,868 B
+//
+// The path is ALREADY a perfect existence oracle to anyone who sends POST, which
+// is what path scanners send. Hiding it from GET is a lock on one door of a
+// two-door room. Worse, it makes the carved-out 404 a NEW false status code
+// under the very clause cited to justify it: §15.5.5's second disjunct requires
+// that we are "not willing to disclose that one exists", and we disclose it on
+// POST, in production, with a distinguishable status, content-type and length.
+// The carve-out would have removed fifteen false 404s and manufactured a
+// sixteenth with a citation attached — and a cited falsehood survives review,
+// which an uncited one does not.
+//
+// Disclosure grants no privilege: the secret check is timing-safe and an unset
+// AUTH_SECRET returns 503. If non-disclosure is ever actually wanted, that is a
+// larger and different change — unauthenticated POST must return the
+// byte-identical 404 that /admin/nonexistent returns — and it should be argued
+// on its own rather than smuggled in as an exception to a rule about telling the
+// truth. Shipping half of it is the only option that is wrong.
+app.notFound(c => {
+  const allow = allowedMethodsFor(c.req.path);
+  if (allow) {
+    // The Allow header is the MUST; it is not decoration. It also gives a client
+    // exactly what an OPTIONS request would have returned, which matters because
+    // we do not implement OPTIONS — RFC 9110 §9.1 (line 3794) makes GET and HEAD
+    // the only mandatory methods and every other one OPTIONAL, so 405 is the
+    // honest answer to OPTIONS rather than an omission to apologise for. Listing
+    // OPTIONS in Allow while refusing it would be the same defect one level in.
+    return htmlResponse(errorPage(405, 'Method not allowed'), 405, {
+      Allow: allow,
+    });
+  }
+  return htmlResponse(errorPage(404, 'Page not found'), 404);
+});
 app.onError((err, _c) => {
   console.error('Unhandled error:', err);
   return htmlResponse(errorPage(500, 'Internal server error'), 500);
