@@ -155,6 +155,32 @@ async function maybeResetUsage(db: D1Database, key: ApiKey): Promise<ApiKey> {
   return key;
 }
 
+// Seconds until the quota gate can next open, for RFC 6585 §4's Retry-After.
+//
+// RFC 6585 §4 defines 429 as "too many requests in a given amount of time
+// ('rate limiting')" and says the response "MAY include a Retry-After header
+// indicating how long to wait before making a new request". The MAY is why this
+// went 56 cycles without one; the reason to send it is that here the value is
+// exactly computable rather than guessed.
+//
+// It mirrors maybeResetUsage() deliberately — same `new Date(y, m, 1)`
+// construction, one month on. That function resets lazily, on the first request
+// after the boundary, so the boundary IS the moment a retry starts succeeding.
+// Workers run in UTC, so the local-component constructor and UTC agree.
+//
+// THE OBLIGATION THIS HEADER CREATES: it is honest only while the quota window
+// is the calendar month. If the window ever becomes rolling-30-day, or
+// anniversary-of-signup, this header becomes a lie and MUST change in the same
+// commit that changes the window. Sending a wrong Retry-After is worse than
+// sending none: none is a MAY declined, wrong is a stated fact that is false.
+function secondsUntilQuotaReset(now: Date = new Date()): number {
+  const nextReset = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+  // RFC 9110 §10.2.3: delay-seconds = 1*DIGIT, a NON-NEGATIVE decimal integer.
+  // Clamped and rounded up so the value is never 0 (which would invite an
+  // immediate retry into the same closed gate) and never a fraction.
+  return Math.max(1, Math.ceil((nextReset.getTime() - now.getTime()) / 1000));
+}
+
 // Record the event, and meter the quota — but only for real renders.
 //
 // Every request is logged to usage_events (cache_hit tells the two apart, which
@@ -523,8 +549,29 @@ app.get('/og', async c => {
         tier: apiKey.tier,
         limit: apiKey.monthly_limit,
         interest_url: '/#interest',
+        retry_after_seconds: secondsUntilQuotaReset(),
       },
-      429
+      429,
+      {
+        // RFC 6585 §4 MAY — sent because the value is computed, not guessed.
+        'Retry-After': String(secondsUntilQuotaReset()),
+        // RFC 6585 §4, final paragraph: "Responses with the 429 status code
+        // MUST NOT be stored by a cache." That MUST NOT binds the cache, not
+        // us, and 429 is not in RFC 9110 §15.1's heuristically-cacheable set,
+        // so a conformant cache would not have stored this anyway. This header
+        // is the enforcing half: it makes the prohibition hold without relying
+        // on every intermediary having read RFC 6585. It also matters more here
+        // than it looks — /og's 200s carry `public, s-maxage=604800`, so this
+        // route is one a shared cache is already actively storing for.
+        'Cache-Control': 'no-store',
+        // DELIBERATELY NO `Vary: Authorization`, though this body is derived
+        // entirely from the credential (it names the key's tier and limit).
+        // Vary selects among responses a cache MAY STORE (RFC 9111 §4.1); we
+        // have just told caches to store nothing. The header would be inert —
+        // legal, plausible, and doing no work. #54's lesson applied to our own
+        // addition. This is a genuine bound on #55 A1: "reads Authorization"
+        // implies Vary only for a STORABLE response.
+      }
     );
   }
 
@@ -790,15 +837,45 @@ app.post('/register', async c => {
     )
     .run();
 
+  // Zero rows written means the per-email ceiling was already reached.
+  //
+  // This answered 429 Too Many Requests for 56 cycles, and that was a misuse.
+  // RFC 6585 §4 defines 429 as "too many requests IN A GIVEN AMOUNT OF TIME
+  // ('rate limiting')". This condition has no time in it: the cap is
+  // `COUNT(*) FROM api_keys WHERE user_id = ?` against a constant, and there is
+  // no `DELETE FROM api_keys` anywhere in this worker, so the count never falls.
+  // Waiting does not help — not in an hour, not ever. 429 is THE canonical
+  // retryable status; mainstream HTTP clients retry it with backoff, which is
+  // why RFC 6585 pairs it with Retry-After. We could not fill that header in
+  // honestly, and that inability was the tell.
+  //
+  // Note the response was already contradicting itself: the BODY says "that's
+  // the maximum" (never) while the STATUS LINE said "too many requests in a
+  // given amount of time" (later). Measured on a local workerd before this fix.
+  //
+  // NOT 409 Conflict, which was the first candidate and was vetoed. RFC 9110
+  // §15.5.10: 409 "is used in situations where the user MIGHT BE ABLE to
+  // resolve the conflict and resubmit the request." With no key-deletion
+  // endpoint the user cannot, so 409 would invite a manual retry that can never
+  // succeed — the same lie as 429, told more quietly.
+  //
+  // 403 Forbidden is the honest code TODAY. RFC 9110 §15.5.4: "the server
+  // understood the request but refuses to fulfill it… The client SHOULD NOT
+  // automatically repeat the request." That anti-retry instruction is exactly
+  // the semantic missing above, and it is carried by the status code itself.
+  //
+  // This code is downstream of a product decision not yet made. Ship key
+  // revocation and 409 becomes the true code the same hour. Until then, 403.
   if ((inserted.meta?.changes ?? 0) === 0) {
     return htmlResponse(
       registerPage(
         origin(c.req.url),
-        `${email} already has ${MAX_KEYS_PER_EMAIL} API keys — that's the maximum. ` +
-          `Use one you already have, or open its dashboard to check usage. ` +
-          `Each key gets its own monthly allowance, so extra keys are not a way to get extra images.`
+        `${email} already has ${MAX_KEYS_PER_EMAIL} API keys — that's the maximum, ` +
+          `and it does not reset. Use one you already have, or open its dashboard ` +
+          `to check usage. Each key gets its own monthly allowance, so extra keys ` +
+          `are not a way to get extra images.`
       ),
-      429
+      403
     );
   }
 

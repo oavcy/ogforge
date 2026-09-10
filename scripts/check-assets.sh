@@ -393,6 +393,120 @@ auth_challenge_defects() { # headers-file  expect(none|invalid)
   return 0
 }
 
+# ---------------------------------- retry semantics (#56)
+# #55 asked "what does my fix make newly possible, and which other standard
+# governs that?" #56 asked a blunter question of one status code we use TWICE:
+# is the code itself true? Fetched this cycle, not recalled:
+#
+#   "The 429 status code indicates that the user has sent too many requests in a
+#    given amount of time ("rate limiting")."
+#   "The response representations SHOULD include details explaining the
+#    condition, and MAY include a Retry-After header indicating how long to wait
+#    before making a new request."
+#   "Responses with the 429 status code MUST NOT be stored by a cache."
+#                                                        -- RFC 6585 §4
+#   "Retry-After = HTTP-date / delay-seconds ... A delay-seconds value is a
+#    non-negative decimal integer"                        -- RFC 9110 §10.2.3
+#   409: "used in situations where the user MIGHT BE ABLE to resolve the
+#    conflict and resubmit the request."                  -- RFC 9110 §15.5.10
+#   403: "the server understood the request but refuses to fulfill it ... The
+#    client SHOULD NOT automatically repeat the request." -- RFC 9110 §15.5.4
+#
+# NOTE WHERE 429 IS *NOT* DEFINED. RFC 9110 does not define it; the string "429"
+# occurs ZERO times in all 502,941 bytes of it, and §15.5 stops at 15.5.22 (426).
+# A citation of "RFC 9110 §15.5.30" for 429 is a phantom. This company's own
+# consensus carried that phantom into the instruction that says "fetch the
+# standard, do not recall it" — recalled, in the sentence telling us not to.
+#
+# THE RULE THIS PREDICATE ENFORCES, which is NOT "429 needs Retry-After":
+#   a status code that invites a retry which can never succeed is a lie,
+#   whatever its number.
+# The first draft of this check was "a 429 whose Retry-After cannot be honestly
+# computed is not a 429". That was rejected as both too narrow and too weak: a
+# genuine load-shedding limiter with jittered recovery cannot compute one and is
+# still unambiguously a 429, and the narrow form let 409 through — 409 invites a
+# MANUAL retry that can never succeed, which is the same lie told more quietly.
+#
+# POST /register answered 429 for 56 cycles when an email held MAX_KEYS_PER_EMAIL
+# keys. There is no time in that condition: the cap is COUNT(*) against a
+# constant and no `DELETE FROM api_keys` exists in the worker, so the count never
+# falls. The response contradicted itself in plain sight — the BODY said "that's
+# the maximum" (never) under a STATUS LINE meaning "too many requests in a given
+# amount of time" (later). Measured on a local workerd, both directions.
+retry_semantics_defects() { # headers-file  condition(transient|permanent)
+  _rf="$1"; _rcond="$2"
+  # An unfetched response makes every verdict below vacuous (#41).
+  [ -s "$_rf" ] || { echo "UNREADABLE: no response headers captured"; return 0; }
+
+  _rst=$(grep -i '^HTTP/' "$_rf" 2>/dev/null | tail -1 | tr -d '\r' | awk '{print $2}')
+  [ -n "$_rst" ] || { echo "UNREADABLE: no status line in captured headers"; return 0; }
+
+  _rra=$(grep -i '^Retry-After:' "$_rf" 2>/dev/null | head -1 | tr -d '\r' \
+         | sed -e 's/^[Rr]etry-[Aa]fter:[[:space:]]*//' -e 's/[[:space:]]*$//')
+  _rcc=$(grep -i '^Cache-Control:' "$_rf" 2>/dev/null | head -1 | tr -d '\r' \
+         | sed -e 's/^[Cc]ache-[Cc]ontrol:[[:space:]]*//')
+
+  # ---- the lie test, first, because it is the whole point -------------------
+  if [ "$_rcond" = "permanent" ]; then
+    case "$_rst" in
+      429)
+        echo "RETRY-LIE: 429 for a condition no amount of waiting clears — RFC 6585 §4 scopes 429 to 'too many requests in a given amount of time'" ;;
+      409)
+        echo "RETRY-LIE: 409 invites a resubmit the user cannot make — RFC 9110 §15.5.10 requires that the user MIGHT resolve the conflict" ;;
+      403) ;;
+      *)   echo "STATUS: got ${_rst} for a permanent refusal; 403 is the code that says SHOULD NOT automatically repeat (RFC 9110 §15.5.4)" ;;
+    esac
+    # A permanent refusal must not suggest a wait, whatever its status number.
+    [ -z "$_rra" ] || \
+      echo "STRAY-RETRY-AFTER: a permanent refusal carries Retry-After: ${_rra}, which states a falsehood"
+  fi
+
+  # ---- 429-specific obligations ---------------------------------------------
+  # Gated on the condition being transient on purpose. If we already said the
+  # 429 is a lie for this condition, demanding it also carry Retry-After would
+  # be self-contradictory advice: "add the header that would state a falsehood".
+  # The defect is the status code; its headers are not the finding.
+  if [ "$_rst" = "429" ] && [ "$_rcond" != "permanent" ]; then
+    if [ -z "$_rra" ]; then
+      # RFC 6585 §4 makes this a MAY. It is a house MUST because OUR window is
+      # the calendar month and the value is therefore exactly computable. A MAY
+      # declined for a good reason is fine; declined because nobody looked is
+      # what this row is for.
+      echo "NO-RETRY-AFTER: 429 without Retry-After, though this service's quota window is computable (RFC 6585 §4)"
+    fi
+    case "$_rcc" in
+      *no-store*) ;;
+      "") echo "CACHEABLE-429: no Cache-Control — RFC 6585 §4 says a 429 MUST NOT be stored by a cache; send no-store rather than trusting every intermediary read it" ;;
+      *)  echo "CACHEABLE-429: Cache-Control '${_rcc}' lacks no-store — RFC 6585 §4 MUST NOT be stored by a cache" ;;
+    esac
+  fi
+
+  # ---- Retry-After syntax and scope, on ANY status --------------------------
+  if [ -n "$_rra" ]; then
+    # RFC 9110 §10.2.3 defines the field for 503 and 3xx; RFC 6585 §4 adds 429.
+    # Anywhere else it is a value no consumer has a rule for (#54's question).
+    case "$_rst" in
+      429|503|3??) ;;
+      *) echo "SCOPE: Retry-After on a ${_rst}; RFC 9110 §10.2.3 defines it for 503 and 3xx, RFC 6585 §4 for 429" ;;
+    esac
+    # delay-seconds = 1*DIGIT, non-negative integer. Reject anything else that
+    # is not a plausible HTTP-date. A negative or fractional value is the shape
+    # a naive (target - now)/1000 produces after the boundary passes.
+    case "$_rra" in
+      *[!0-9]*)
+        # Not all digits — allow an IMF-fixdate, reject the rest.
+        case "$_rra" in
+          *,\ *[0-9]*\ GMT) ;;
+          *) echo "MALFORMED: Retry-After '${_rra}' is neither delay-seconds (1*DIGIT) nor an HTTP-date (RFC 9110 §10.2.3)" ;;
+        esac ;;
+      "") echo "MALFORMED: Retry-After is empty" ;;
+      0)  echo "MALFORMED: Retry-After: 0 invites an immediate retry into the same closed gate" ;;
+      *)  ;;
+    esac
+  fi
+  return 0
+}
+
 # ------------------------------------------------------------------- URL helpers
 # Normalize a raw attribute value to an absolute URL on BASE, or emit nothing if
 # the reference is out of scope (external host, anchor, mailto:, data:, ...).
@@ -1383,6 +1497,72 @@ self_test() {
     fi
   done
 
+  # 16d. RETRY SEMANTICS (#56). Thirteen fixtures through the same predicate the
+  #      live check uses. The first two are the responses this worker actually
+  #      served until this cycle — captured from a real workerd running the
+  #      pre-fix source against a local D1 seeded to hit each branch, not
+  #      imagined. Two green controls (one transient, one permanent) are here
+  #      because a check that flags every 429 is worth nothing, and a check that
+  #      flags every permanent refusal would flag the fix itself.
+  st_rtdir="$WORKDIR/selftest-retry"; mkdir -p "$st_rtdir"
+
+  # --- verbatim captures, local workerd, pre-fix source ---
+  printf 'HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\n\r\n' \
+    > "$st_rtdir/pre56-og.txt"
+  printf 'HTTP/1.1 429 Too Many Requests\r\nContent-Type: text/html; charset=utf-8\r\n\r\n' \
+    > "$st_rtdir/pre56-register.txt"
+  # --- verbatim captures, same runtime, post-fix source ---
+  printf 'HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nRetry-After: 1803702\r\n\r\n' \
+    > "$st_rtdir/good-transient.txt"
+  printf 'HTTP/1.1 403 Forbidden\r\nContent-Type: text/html; charset=utf-8\r\n\r\n' \
+    > "$st_rtdir/good-permanent.txt"
+  # --- synthetic: each isolates one clause ---
+  printf 'HTTP/1.1 429 Too Many Requests\r\nCache-Control: no-store\r\n\r\n' \
+    > "$st_rtdir/no-retry-after.txt"
+  printf 'HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1803702\r\nCache-Control: public, max-age=60\r\n\r\n' \
+    > "$st_rtdir/cacheable-429.txt"
+  printf 'HTTP/1.1 429 Too Many Requests\r\nCache-Control: no-store\r\nRetry-After: -5\r\n\r\n' \
+    > "$st_rtdir/negative.txt"
+  printf 'HTTP/1.1 429 Too Many Requests\r\nCache-Control: no-store\r\nRetry-After: 1803702.5\r\n\r\n' \
+    > "$st_rtdir/fractional.txt"
+  printf 'HTTP/1.1 429 Too Many Requests\r\nCache-Control: no-store\r\nRetry-After: soon\r\n\r\n' \
+    > "$st_rtdir/wordy.txt"
+  printf 'HTTP/1.1 429 Too Many Requests\r\nCache-Control: no-store\r\nRetry-After: Thu, 01 Oct 2026 00:00:00 GMT\r\n\r\n' \
+    > "$st_rtdir/http-date.txt"
+  printf 'HTTP/1.1 403 Forbidden\r\nRetry-After: 3600\r\n\r\n' \
+    > "$st_rtdir/permanent-with-wait.txt"
+  printf 'HTTP/1.1 409 Conflict\r\nContent-Type: text/html\r\n\r\n' \
+    > "$st_rtdir/vetoed-409.txt"
+  : > "$st_rtdir/unfetchable.txt"
+
+  for st_case in \
+    "2|pre56-og.txt|transient|the 429 /og served until #56 — no Retry-After, storable" \
+    "1|pre56-register.txt|permanent|the 429 /register served until #56 — the retry lie itself" \
+    "0|good-transient.txt|transient|post-fix /og 429: computed Retry-After + no-store, must be clean" \
+    "0|good-permanent.txt|permanent|post-fix /register 403: must be clean, or the fix fails its own gate" \
+    "1|no-retry-after.txt|transient|a 429 with no Retry-After is rejected" \
+    "1|cacheable-429.txt|transient|a 429 a cache may store is rejected (RFC 6585 §4)" \
+    "1|negative.txt|transient|Retry-After: -5 is rejected (delay-seconds is non-negative)" \
+    "1|fractional.txt|transient|a fractional Retry-After is rejected (1*DIGIT)" \
+    "1|wordy.txt|transient|a non-numeric, non-date Retry-After is rejected" \
+    "0|http-date.txt|transient|an IMF-fixdate Retry-After is accepted, not just seconds" \
+    "2|permanent-with-wait.txt|permanent|a permanent refusal advertising a wait is rejected twice" \
+    "1|vetoed-409.txt|permanent|409 for an unresolvable conflict is rejected — the quiet lie" \
+    "1|unfetchable.txt|transient|an uncaptured response reports UNREADABLE, never a pass"
+  do
+    st_want=${st_case%%|*}; st_rest=${st_case#*|}
+    st_file=${st_rest%%|*}; st_rest=${st_rest#*|}
+    st_cond=${st_rest%%|*}; st_desc=${st_rest#*|}
+    st_got=$(retry_semantics_defects "$st_rtdir/$st_file" "$st_cond" | grep -c . | head -1)
+    if [ "$st_got" = "$st_want" ]; then
+      row "selftest" "retry" "OK" "$st_got" "semantics" "$st_desc"
+    else
+      row "selftest" "retry" "BAD" "$st_got" "semantics" \
+          "$st_desc — got ${st_got} defect(s), wanted ${st_want}"
+      st_fail=1
+    fi
+  done
+
   # 17. THE EXIT CODE ITSELF. Every assertion above tests a pure function; none of
   #     them would notice if the exit-code block were deleted. That block is the
   #     one thing this design cites as making the external class falsifiable
@@ -2166,6 +2346,79 @@ if [ "$MODE" != "docs-only" ]; then
         row "" "auth" "" "" "" "  $au_d"
         printf '%s\t%s\t%s\t%s\n' "/og" "auth" "${BASE}${au_path}" "$au_d" >> "$FAILLOG"
       done < "$au_defects"
+    fi
+  done
+fi
+
+# ---- live retry semantics (#56) ----------------------------------------------
+# THE HONEST BOUND ON THIS SECTION, stated before its rows so it cannot be read
+# as more than it is (#51 A4, #55 A4):
+#
+#   The two branches #56 fixed are NOT anonymously reachable in production. The
+#   /og quota 429 needs a valid key with an exhausted allowance; the /register
+#   403 needs an email already holding MAX_KEYS_PER_EMAIL keys. This cycle is
+#   forbidden from registering a key, so neither can be probed from here.
+#   Both were MEASURED, both directions, on a local workerd running this exact
+#   source against a local D1 seeded to hit each branch — that is what the four
+#   captured fixtures in the self-test are. Production behaviour is INFERRED
+#   from identical source on an identical runtime. It is not measured.
+#
+# So these live rows assert the CONTRAPOSITIVE, which is what the anonymous
+# surface can actually testify to: nothing reachable emits a 429, and nothing
+# reachable carries a Retry-After that is malformed or outside the statuses the
+# RFCs define it for. That is a genuine tripwire — it goes red if a future cycle
+# adds a 429 to an anonymous path — and it is NOT a proof of the fix.
+#
+# The /register probe is the one live row that reaches a handler #56 edited. It
+# POSTs a deliberately invalid email. That path returns 400 from the EMAIL_RE
+# guard, which sits ahead of every INSERT in the handler, so it writes nothing:
+# no tier_interest row, no users upsert, no key. Verified by reading the handler
+# and by re-counting `users` after the probe.
+if [ "$MODE" != "docs-only" ]; then
+  echo
+  echo "RETRY SEMANTICS   (RFC 6585 §4 · RFC 9110 §10.2.3, §15.5.4, §15.5.10)"
+  hr
+  for rt_case in \
+    "/|GET|anonymous landing page" \
+    "/register|GET|the signup form" \
+    "/og?title=probe|GET|the metered route, unauthenticated" \
+    "/postmortem/hits|GET|the JSON gauge" \
+    "/health|GET|liveness" \
+    "/register|POST|the changed handler, via its pre-INSERT 400 guard"
+  do
+    rt_path=${rt_case%%|*}; rt_rest=${rt_case#*|}
+    rt_meth=${rt_rest%%|*}; rt_desc=${rt_rest#*|}
+    rt_file="$WORKDIR/retry-$(printf '%s' "${rt_meth}${rt_path}" | tr -c 'A-Za-z0-9' '-').hdr"
+    if [ "$rt_meth" = "POST" ]; then
+      curl -sS --compressed --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" \
+           -A "$UA" -X POST --data-urlencode 'email=ogforge-gate-probe-no-at-sign' \
+           --data-urlencode 'keyname=gate' \
+           -D "$rt_file" -o /dev/null "${BASE}${rt_path}" 2>/dev/null || :
+    else
+      curl -sS --compressed --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" \
+           -A "$UA" -D "$rt_file" -o /dev/null "${BASE}${rt_path}" 2>/dev/null || :
+    fi
+    # Every anonymously reachable response is, by construction, NOT one of the
+    # two permanent/metered branches — so `transient` is the right expectation
+    # and a 429 appearing here at all is what this row is watching for.
+    rt_defects="$WORKDIR/retry-defects-$$.txt"
+    retry_semantics_defects "$rt_file" "transient" > "$rt_defects"
+    rt_st=$(grep -i '^HTTP/' "$rt_file" 2>/dev/null | tail -1 | tr -d '\r' | awk '{print $2}')
+    rt_n=$(grep -c . "$rt_defects" 2>/dev/null | head -1)
+    rt_n=${rt_n:-0}
+    TOTAL=$((TOTAL + 1))
+    if [ "$rt_n" -eq 0 ]; then
+      PASSED=$((PASSED + 1))
+      row "$rt_meth $rt_path" "retry" "PASS" "${rt_st:-?}" "semantics" \
+          "${rt_desc} — no 429, no stray Retry-After"
+    else
+      FAILED=$((FAILED + 1))
+      row "$rt_meth $rt_path" "retry" "FAIL" "${rt_st:-?}" "semantics" "${rt_desc} — ${rt_n} defect(s)"
+      while IFS= read -r rt_d; do
+        [ -n "$rt_d" ] || continue
+        row "" "retry" "" "" "" "  $rt_d"
+        printf '%s\t%s\t%s\t%s\n' "$rt_path" "retry" "${BASE}${rt_path}" "$rt_d" >> "$FAILLOG"
+      done < "$rt_defects"
     fi
   done
 fi
