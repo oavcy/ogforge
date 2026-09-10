@@ -1073,8 +1073,44 @@ app.post('/admin/upgrade', async c => {
 });
 
 // ── Dashboard ─────────────────────────────────────────────────────────────────
+// THE CONSTRAINT, WRITTEN DOWN — Cycle #62. It has governed this product since
+// day one and had never been stated anywhere, in code or in docs.
+//
+// An `og:image` URL is fetched by anonymous third parties (Twitterbot, Slackbot,
+// facebookexternalhit). It therefore CANNOT carry a request header, and the
+// landing page consequently instructs the user to embed the credential itself:
+//   <meta property="og:image" content="…/og?title=…&key=YOUR_KEY" />
+// So the key is public BY CONSTRUCTION for the primary use case. Not by accident,
+// not by a defect — there is no design of this product in which it is otherwise.
+//
+// A credential that must be published is legitimate (Stripe `pk_`, Maps browser
+// keys) when three properties hold: it is SCOPED to low-harm operations, it is
+// RESTRICTABLE to an origin, and it is REVOCABLE. This product has none of them:
+// `domain=` is a cosmetic render label, `Referer`/`Origin` are client-supplied or
+// absent so no origin lock is verifiable (Cycle #61), and there is no revocation.
+//
+// The line below was the third property's cost: `/dashboard` authenticated with
+// `c.req.query('key')` — THE SAME STRING the landing page tells the user to
+// publish — so the published render token was also the account console token.
+// That is the part this cycle can act on, and the rule it leaves behind is:
+//
+//   *** /dashboard MUST NEVER grow an operation whose loss the holder of a
+//   *** published og:image URL could not tolerate. Read-only, forever, until
+//   *** the credential embedded in customer HTML stops being this string.
+//
+// Cycle #62 does not change WHICH string is accepted — removing `?key=` would
+// break every issued key and the documented interface. It adds the RFC 6750 §2.1
+// header form, which readCredential() has offered on /og since Cycle #55 and
+// which this route silently ignored. Measured before the change: a request to
+// /dashboard carrying `Authorization: Bearer …` and no query param returned a
+// byte-identical 16,964 B "Get API Key" page — the header did nothing.
+//
+// The asymmetry is the point: /og advertises the recommended form to a caller
+// (a <meta> tag) that structurally cannot send it, while /dashboard withheld it
+// from the one caller (a human at a terminal) who can. The mitigation had been
+// installed exactly where the primary use case could not reach it.
 app.get('/dashboard', async c => {
-  const rawKey = c.req.query('key');
+  const rawKey = readCredential(c);
   if (!rawKey) {
     // 200, not 400. Every page's nav links here, so this is the ordinary way a
     // stranger arrives — and what they get back is a usable page asking for
@@ -1086,10 +1122,24 @@ app.get('/dashboard', async c => {
     // 'other' is load-bearing: this is /dashboard, not /register. Without it the
     // register page's canonical and og:url name /register while the request URL is
     // /dashboard — see the note on registerPage.
+    // `Vary: Authorization` — the second half of this cycle's change, shipped in
+    // the same commit because half of it is worse than none (#55 A1). Reading the
+    // `Authorization` header is exactly what makes `Vary` mandatory here.
+    //
+    // ONLY this branch gets it, and the asymmetry is reasoned, not sloppy:
+    //   • this branch is the one storable response on the route (it deliberately
+    //     carries no Cache-Control — #58 A6's over-fire control), and as of this
+    //     commit its representation is selected by a request header. Without
+    //     `Vary`, a shared cache may store this "Get API Key" page and hand it
+    //     back to a caller presenting a valid Bearer token. RFC 9111 §4.1.
+    //   • the two branches below are `no-store`, where `Vary` selects among
+    //     responses a cache MAY STORE and is therefore inert (#56 A3). Adding it
+    //     there would be a plausible, legal, load-bearing-looking no-op.
+    // Note this does NOT add Cache-Control to this branch; it stays the control.
     return htmlResponse(
       registerPage(origin(c.req.url), 'Enter your API key or create a new one below', 'other'),
       200,
-      NOINDEX_HEADER
+      { ...NOINDEX_HEADER, Vary: 'Authorization' }
     );
   }
 

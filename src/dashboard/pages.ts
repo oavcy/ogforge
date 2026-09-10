@@ -992,6 +992,13 @@ export function dashboardPage(
             <pre><span class="c-key">&lt;meta</span> <span class="c-val">property=</span><span class="c-str">"og:image"</span>
       <span class="c-val">content=</span><span class="c-str">"${origin}/og?title=YOUR_TITLE&amp;key=${key.key_prefix}..."</span> <span class="c-key">/&gt;</span></pre>
           </div>
+          <p style="font-size:13px;color:var(--text-2);margin-top:10px;line-height:1.6;">
+            This tag goes in your public page source, so <strong>the key in it is public</strong>.
+            Crawlers fetch <code>og:image</code> without authentication, which is why the key
+            cannot be sent as a header here. It spends this key&rsquo;s monthly allowance and
+            opens this usage page. There is no way to revoke a key yet, and each email gets
+            three, permanently &mdash; so treat it as published the moment you deploy the tag.
+          </p>
           <div class="code-block" style="margin-top:12px;">
             <div class="code-block-header">
               <div class="code-block-dots">
@@ -999,9 +1006,19 @@ export function dashboardPage(
               </div>
               <span class="code-block-lang">cURL test</span>
             </div>
-            <pre><span class="c-key">curl</span> <span class="c-str">"${origin}/og?title=My+Blog+Post&amp;domain=myblog.com&amp;key=${key.key_prefix}..."</span> \
-  <span class="c-val">--output</span> og.png && <span class="c-key">open</span> og.png</pre>
+            <pre><span class="c-key">curl</span> <span class="c-str">"${origin}/og?title=My+Blog+Post&amp;domain=myblog.com"</span> \
+  <span class="c-val">-H</span> <span class="c-str">"Authorization: Bearer ${key.key_prefix}..."</span> \
+  <span class="c-val">--output</span> og.png && <span class="c-key">open</span> og.png
+
+<span class="c-comment"># Same header works here — keeps the key out of shell history and logs</span>
+<span class="c-key">curl</span> <span class="c-str">"${origin}/dashboard"</span> <span class="c-val">-H</span> <span class="c-str">"Authorization: Bearer ${key.key_prefix}..."</span></pre>
           </div>
+          <p style="font-size:13px;color:var(--text-2);margin-top:10px;line-height:1.6;">
+            Anywhere you control the request &mdash; curl, a server-side fetch, a build script
+            &mdash; send the key as an <code>Authorization</code> header instead of a query
+            parameter. RFC&nbsp;6750 &sect;2.3 rates the query form &ldquo;NOT RECOMMENDED&rdquo;;
+            the <code>&lt;meta&gt;</code> tag above has no alternative, everything else does.
+          </p>
         </div>
 
       </div>
