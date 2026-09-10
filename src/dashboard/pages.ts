@@ -996,8 +996,11 @@ export function dashboardPage(
             This tag goes in your public page source, so <strong>the key in it is public</strong>.
             Crawlers fetch <code>og:image</code> without authentication, which is why the key
             cannot be sent as a header here. It spends this key&rsquo;s monthly allowance and
-            opens this usage page. There is no way to revoke a key yet, and each email gets
-            three, permanently &mdash; so treat it as published the moment you deploy the tag.
+            opens this usage page. <strong>A key cannot be withdrawn</strong> &mdash; not
+            &ldquo;not yet&rdquo;: there is no account here separate from the key itself, so a
+            revoke control would have to answer to whoever holds the key, which is anyone who
+            read it off your page. Each email gets three keys, permanently. Treat the key as
+            public the moment you deploy the tag.
           </p>
           <div class="code-block" style="margin-top:12px;">
             <div class="code-block-header">

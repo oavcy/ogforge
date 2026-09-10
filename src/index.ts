@@ -511,10 +511,42 @@ const AUTH_REALM = 'ogforge';
 // information." Only a credential that was SUPPLIED AND REJECTED earns one.
 // The description is a fixed literal — never interpolate the submitted key,
 // which would reflect an attacker's bytes into a quoted header value.
+//
+// Cycle #63. This description used to read "The API key is expired, revoked, or
+// not valid", and TWO OF THOSE THREE STATES DO NOT EXIST IN THIS SYSTEM. There
+// is no expiry column and no revocation anywhere in the schema — checked by
+// command against all three migrations, which contain no `expire`, `revoke`,
+// `suspend`, `disable` or `status` column. A key is valid from creation until
+// the database is destroyed. So of the three causes we named to every rejected
+// caller, exactly one was reachable.
+//
+// The provenance is the interesting part, and it is not carelessness. RFC 6750
+// §3.1 (fetched, not recalled — rfc-editor.org/rfc/rfc6750.txt, 200, 38,949 B)
+// DEFINES the error CODE this way at line 476:
+//
+//   "invalid_token — The access token provided is expired, revoked, malformed,
+//    or invalid for other reasons."
+//
+// That sentence enumerates the conditions under which an implementation should
+// choose `error="invalid_token"`. It is a disjunction across ALL deployments.
+// #55 pasted it into `error_description`, which §3 line 418 defines as "a
+// human-readable explanation" — of THIS failure, to THIS developer. Copying the
+// code's applicability list into the description converts a statement about
+// when a code applies into a claim about what just happened to one request.
+//
+// Our single reachable cause is the RFC's own catch-all, "invalid for other
+// reasons": the supplied credential hashed to nothing in `api_keys`. Say that,
+// and nothing else. Note the response was already contradicting itself — the
+// JSON body says "Invalid API key" (one cause, true) while this header said
+// three, two of them impossible, in the SAME response. The body was right.
+//
+// Character set is constrained: RFC 6750 §3 line 428 restricts this value to
+// %x20-21 / %x23-5B / %x5D-7E, which excludes `"` and `\`. Keep it plain ASCII
+// with no quotes or backslashes.
 function bearerChallenge(invalidToken = false): string {
   return invalidToken
     ? `Bearer realm="${AUTH_REALM}", error="invalid_token", ` +
-        `error_description="The API key is expired, revoked, or not valid"`
+        `error_description="No API key matches the credential supplied"`
     : `Bearer realm="${AUTH_REALM}"`;
 }
 
@@ -958,6 +990,34 @@ app.post('/register', async c => {
   //
   // This code is downstream of a product decision not yet made. Ship key
   // revocation and 409 becomes the true code the same hour. Until then, 403.
+  //
+  // CYCLE #63: THAT LAST SENTENCE WAS A WORK ORDER THIS FILE ISSUED TO ITSELF,
+  // AND IT WAS CITED BACK SIX CYCLES LATER AS A REQUIREMENT. #63 was assigned
+  // to ship revocation and close it. It was VETOED, and the reason belongs
+  // beside the code rather than only in a doc, because the next cycle to read
+  // this comment will otherwise re-run the same job:
+  //
+  //   • The cap has never fired. Measured against remote D1 this cycle:
+  //     MAX(keys per user) = 1 across all 7 users, 7 of 7 holding exactly one.
+  //     This branch has not executed once in the product's life.
+  //   • Revocation here could only be authenticated BY THE KEY, because there
+  //     is no other credential — `readCredential()` is the whole auth system
+  //     and there is no mail channel in the worker (checked: no resend /
+  //     sendgrid / mailgun / postmark / smtp / mailchannels anywhere).
+  //   • And the front page instructs the user to PUBLISH that key in page
+  //     source. So a revoke route would let any stranger who viewed the source
+  //     destroy the key permanently — with the 3-key lifetime cap, walk an
+  //     account to zero. Today the worst case for a leaked key is quota theft,
+  //     bounded by monthly_limit and self-healing at rollover (maybeResetUsage).
+  //     Revocation would convert a bounded, self-healing harm into an
+  //     unbounded, unrecoverable one.
+  //
+  // So the ordering in the "scoped, restrictable, revocable" property list is
+  // wrong for this product: revocation is not the third of three, it is the
+  // FOURTH OF FOUR, and the third — an account identity distinct from the
+  // credential — does not exist. Shipping it before that is what makes it
+  // harmful rather than merely unnecessary. 403 stays, and it stays honest.
+  // Do not "fix" this to 409 and do not build revocation to justify the 409.
   if ((inserted.meta?.changes ?? 0) === 0) {
     return htmlResponse(
       registerPage(
