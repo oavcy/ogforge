@@ -652,6 +652,107 @@ method_semantics_defects() { # headers-file  request-method  expectation(disclos
   return 0
 }
 
+# ---- cache semantics (#58) ---------------------------------------------------
+# RFC 9111 §4.2.2 lets a cache invent a freshness lifetime for any response that
+# carries no explicit expiration and whose status is heuristically cacheable
+# (RFC 9110 line 6953 for 200, line 7597 for 404). Four of our responses are
+# selected by "now" or by one caller's key, and inherited that default.
+#
+# `heuristic` is not a weaker expectation than `no-store`, it is the OPPOSITE
+# one, and it is the reason this section can fail. Without it, a change that
+# no-stored the entire surface would turn every other row green. That failure
+# mode is not hypothetical for this fix: `no-store` is the kind of directive
+# that looks harmless everywhere, so the cheapest wrong implementation is one
+# global header, and the ONLY row that would notice is one asserting a response
+# must remain storable.
+# Emit "METHOD /path", one per line, sorted, for every Hono route registration
+# in a source file. Line comments are stripped FIRST — that is the whole fix, and
+# without it this function has the same defect as the grep it replaces.
+# `app.use` is deliberately not matched: it registers method ALL, which is
+# middleware and not part of the method surface (#57 A3 — and note that the
+# wrong way to exclude it is by looking for a `*` in the path, since
+# `app.use('/dashboard', mw)` has no star).
+route_pairs() { # source-file
+  sed -E 's@^[[:space:]]*//.*@@' "$1" 2>/dev/null \
+    | grep -oE "app\.(get|post|put|delete|all)\([^,)]+" \
+    | sed -E "s/^app\.//; s/\(/ /; s/[\`'\"]//g" \
+    | sed -E "s@\\\$\{POSTMORTEM_PATH\}@/postmortem/self-certifying-ci-gate@" \
+    | sed -E "s@^([a-z]+) POSTMORTEM_PATH\$@\1 /postmortem/self-certifying-ci-gate@" \
+    | awk 'NF==2 {print toupper($1), $2}' \
+    | sort
+}
+
+cache_semantics_defects() { # headers-file  expectation(no-store|heuristic)
+  _cf="$1"; _cexp="$2"
+  [ -s "$_cf" ] || { echo "UNREADABLE: no response headers captured"; return 0; }
+  _cst=$(grep -i '^HTTP/' "$_cf" 2>/dev/null | tail -1 | tr -d '\r' | awk '{print $2}')
+  [ -n "$_cst" ] || { echo "UNREADABLE: no status line in captured headers"; return 0; }
+
+  # Count on its own line then head -1 (#54: `grep -c` prints 0 and EXITS 1).
+  _ccc=$(grep -ci '^Cache-Control:' "$_cf" 2>/dev/null | head -1); _ccc=${_ccc:-0}
+  _ccv=$(grep -i '^Cache-Control:' "$_cf" 2>/dev/null | head -1 | tr -d '\r' \
+         | sed -e 's/^[Cc]ache-[Cc]ontrol:[[:space:]]*//' -e 's/[[:space:]]*$//')
+  # Comma-fenced and space-free, so membership is exact rather than
+  # substring-lucky: a bare *no-store* also matches "no-store-please", and
+  # *private* matches nothing useful inside "no-transform".
+  _cnorm=",$(printf '%s' "$_ccv" | tr 'A-Z' 'a-z' | tr -d ' '),"
+
+  case "$_cexp" in
+    no-store)
+      if [ "$_ccc" -eq 0 ]; then
+        echo "HEURISTICALLY-CACHEABLE: ${_cst} with no Cache-Control — RFC 9111 §4.2.2 lets a cache assign its own freshness lifetime, and this representation is selected by the current time or by one caller's key"
+        return 0
+      fi
+      [ "$_ccc" -eq 1 ] || \
+        echo "DUPLICATE-CACHE-CONTROL: ${_ccc} Cache-Control headers; send one list"
+      case "$_cnorm" in
+        *",no-store,"*) _chas=1 ;;
+        *) _chas=0
+           echo "WRONG-DIRECTIVE: Cache-Control is '${_ccv}' with no no-store — RFC 9111 §5.2.2.5 is the directive that binds both private and shared caches" ;;
+      esac
+      # THE ROWS BELOW ARE GUARDED ON no-store BEING PRESENT, and the self-test
+      # is why. Ungated, `public, max-age=3600` reported three defects: the
+      # correct WRONG-DIRECTIVE, plus "'public' sits beside no-store" and
+      # "'max-age=3600' sits beside no-store" — on a response with no no-store
+      # in it. Both messages were false statements about the header they were
+      # reading, and each was individually plausible enough to survive a skim.
+      # A checker that says a true thing about the wrong header is the same
+      # defect class it is here to find (#57 A3: a test must test the property
+      # it names).
+      [ "$_chas" -eq 1 ] || return 0
+      # A stored-lifetime directive beside no-store is self-contradictory. §5.2.2.5
+      # wins, so nothing breaks — which is exactly why nothing would report it.
+      for _ctok in $(printf '%s' "$_cnorm" | tr ',' ' '); do
+        case "$_ctok" in
+          max-age=*|s-maxage=*|public)
+            echo "CONTRADICTORY-DIRECTIVE: '${_ctok}' sits beside no-store; one says store it for a while and the other says never store it" ;;
+          private)
+            # #56 A3, aimed at this cycle's own addition. no-store already binds
+            # both cache classes, so `private` here is legal, plausible, and
+            # does no work — the same shape as a Vary on a no-store response.
+            echo "INERT-DIRECTIVE: 'private' beside no-store adds nothing — §5.2.2.5 already binds both private and shared caches" ;;
+        esac
+      done
+      # A validator exists to make a revalidation cheap. There is nothing stored
+      # to revalidate, so one here is inert in the same way `private` is.
+      for _cvh in ETag Last-Modified Expires; do
+        _cvn=$(grep -ci "^${_cvh}:" "$_cf" 2>/dev/null | head -1); _cvn=${_cvn:-0}
+        [ "$_cvn" -eq 0 ] || \
+          echo "INERT-VALIDATOR: ${_cvh} on a no-store response — nothing may be stored, so there is nothing to revalidate"
+      done
+      ;;
+    heuristic)
+      # THE OVER-FIRE CONTROL. Asserts a response must remain storable.
+      case "$_cnorm" in
+        *",no-store,"*)
+          echo "OVER-FIRED: no-store on a response with no per-caller or time-dependent content — the fix was applied wholesale instead of per call site" ;;
+      esac
+      ;;
+    *) echo "UNREADABLE: unknown expectation '${_cexp}'" ;;
+  esac
+  return 0
+}
+
 # ------------------------------------------------------------------- URL helpers
 # Normalize a raw attribute value to an absolute URL on BASE, or emit nothing if
 # the reference is out of scope (external host, anchor, mailto:, data:, ...).
@@ -1775,7 +1876,114 @@ self_test() {
     fi
   done
 
-  # 17. THE EXIT CODE ITSELF. Every assertion above tests a pure function; none of
+  # 17. CACHE SEMANTICS (#58). The four pre/post pairs below are verbatim from a
+  #     local workerd running HEAD source and then this cycle's source against a
+  #     local D1 seeded with one api_keys row — the only way to execute the
+  #     valid-key branch without registering a key in production. The synthetic
+  #     rows isolate one clause each, including the two "legal, plausible, does
+  #     nothing" shapes (`private` and a validator beside no-store) that no
+  #     client would ever error on and so nothing else would report.
+  st_csdir="$WORKDIR/selftest-cache"; mkdir -p "$st_csdir"
+  # --- verbatim, local workerd, PRE-fix source (what production served) ---
+  printf 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n' \
+    > "$st_csdir/pre58-health.txt"
+  printf 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Robots-Tag: noindex, nofollow\r\n\r\n' \
+    > "$st_csdir/pre58-hits.txt"
+  printf 'HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nX-Robots-Tag: noindex, nofollow\r\n\r\n' \
+    > "$st_csdir/pre58-dash-keyed.txt"
+  printf 'HTTP/1.1 404 Not Found\r\nContent-Type: text/html; charset=utf-8\r\nX-Robots-Tag: noindex, nofollow\r\n\r\n' \
+    > "$st_csdir/pre58-dash-badkey.txt"
+  # --- verbatim, same runtime, POST-fix source ---
+  printf 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\n\r\n' \
+    > "$st_csdir/good-health.txt"
+  printf 'HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nX-Robots-Tag: noindex, nofollow\r\nCache-Control: no-store\r\n\r\n' \
+    > "$st_csdir/good-dash-keyed.txt"
+  printf 'HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nX-Robots-Tag: noindex, nofollow\r\n\r\n' \
+    > "$st_csdir/good-dash-nokey.txt"
+  # --- synthetic: one clause each ---
+  printf 'HTTP/1.1 200 OK\r\nCache-Control: private, no-store\r\n\r\n' > "$st_csdir/inert-private.txt"
+  printf 'HTTP/1.1 200 OK\r\nCache-Control: no-store, max-age=60\r\n\r\n' > "$st_csdir/contradict.txt"
+  printf 'HTTP/1.1 200 OK\r\nCache-Control: public, max-age=3600\r\n\r\n' > "$st_csdir/wrong-directive.txt"
+  printf 'HTTP/1.1 200 OK\r\nCache-Control: no-store\r\nETag: "abc"\r\n\r\n' > "$st_csdir/inert-validator.txt"
+  printf 'HTTP/1.1 200 OK\r\nCache-Control: no-store\r\nCache-Control: max-age=5\r\n\r\n' \
+    > "$st_csdir/duplicate-cc.txt"
+  printf 'HTTP/1.1 200 OK\r\nCache-Control: no-store\r\n\r\n' > "$st_csdir/overfire.txt"
+  printf 'HTTP/1.1 200 OK\r\nCache-Control: no-store-please\r\n\r\n' > "$st_csdir/lookalike.txt"
+  : > "$st_csdir/unfetchable.txt"
+
+  for st_case in \
+    "1|pre58-health.txt|no-store|the headerless /health served until #58 — heuristically cacheable" \
+    "1|pre58-hits.txt|no-store|the headerless live counter served until #58" \
+    "1|pre58-dash-keyed.txt|no-store|the headerless keyed dashboard — local workerd, HEAD source" \
+    "1|pre58-dash-badkey.txt|no-store|the headerless key-dependent 404 (404 is heuristically cacheable, 9110 line 7597)" \
+    "0|good-health.txt|no-store|post-fix /health must be clean" \
+    "0|good-dash-keyed.txt|no-store|post-fix keyed dashboard must be clean — local workerd, this source" \
+    "0|good-dash-nokey.txt|heuristic|the no-key branch must STAY storable — the over-fire control" \
+    "1|overfire.txt|heuristic|a no-store where none belongs is rejected: this is the row a route-wide header trips" \
+    "1|inert-private.txt|no-store|'private' beside no-store is rejected as inert (#56 A3, on our own addition)" \
+    "1|contradict.txt|no-store|max-age beside no-store is rejected as self-contradictory" \
+    "1|wrong-directive.txt|no-store|'public, max-age' where no-store is required is rejected" \
+    "1|inert-validator.txt|no-store|an ETag on a no-store response is rejected as inert" \
+    "1|duplicate-cc.txt|no-store|two Cache-Control headers are rejected — send one list" \
+    "1|lookalike.txt|no-store|'no-store-please' must NOT satisfy no-store — the comma-fencing row" \
+    "1|unfetchable.txt|no-store|an uncaptured response reports UNREADABLE, never a pass"
+  do
+    st_want=${st_case%%|*}; st_rest=${st_case#*|}
+    st_file=${st_rest%%|*}; st_rest=${st_rest#*|}
+    st_exp=${st_rest%%|*};  st_desc=${st_rest#*|}
+    st_got=$(cache_semantics_defects "$st_csdir/$st_file" "$st_exp" | grep -c . | head -1)
+    if [ "$st_got" = "$st_want" ]; then
+      row "selftest" "cache" "OK" "$st_got" "semantics" "$st_desc"
+    else
+      row "selftest" "cache" "BAD" "$st_got" "semantics" \
+          "$st_desc — got ${st_got} defect(s), wanted ${st_want}"
+      st_fail=1
+    fi
+  done
+
+  # 18. THE ROUTE EXTRACTOR (#57 A5). The first fixture is the one that matters:
+  #     it is the exact prose shape that moved the old greps from 16/18 to 17/19
+  #     — a comment ABOUT routing, containing route-registration syntax. A
+  #     string counter reads it as two routes. Nothing else in this file would
+  #     have noticed, because the wrong answer is a plausible number.
+  st_rsdir="$WORKDIR/selftest-routes"; mkdir -p "$st_rsdir"
+  printf 'app.get(%s/real%s, h);\n// app.use(%s/dashboard%s, mw) -> { method: ALL } <- no star\n//   app.post(%s/fake%s, h) is prose, not a route\n' \
+    "'" "'" "'" "'" "'" "'" > "$st_rsdir/prose.ts"
+  printf 'app.get(%s/a%s, h);\napp.post(%s/a%s, h);\napp.get(%s/b%s, h);\n' \
+    "'" "'" "'" "'" "'" "'" > "$st_rsdir/pairs.ts"
+  printf 'app.use(%s*%s, mw);\napp.get(%s/a%s, h);\n' "'" "'" "'" "'" > "$st_rsdir/middleware.ts"
+  printf '// nothing here but a comment about app.get(\n' > "$st_rsdir/empty.ts"
+  for st_case in \
+    "1|prose.ts|a comment containing app.use(/dashboard) and app.post(/fake) must count ONE route, not three" \
+    "3|pairs.ts|two methods on one path are TWO pairs — the count the old greps could not express" \
+    "1|middleware.ts|app.use is middleware (method ALL) and is not part of the method surface" \
+    "0|empty.ts|a file with only prose yields zero pairs, which the caller treats as FAIL not PASS"
+  do
+    st_want=${st_case%%|*}; st_rest=${st_case#*|}
+    st_file=${st_rest%%|*}; st_desc=${st_rest#*|}
+    st_got=$(route_pairs "$st_rsdir/$st_file" | grep -c . | head -1)
+    if [ "$st_got" = "$st_want" ]; then
+      row "selftest" "routes" "OK" "$st_got" "surface" "$st_desc"
+    else
+      row "selftest" "routes" "BAD" "$st_got" "surface" \
+          "$st_desc — got ${st_got} pair(s), wanted ${st_want}"
+      st_fail=1
+    fi
+  done
+  # The old grep, run on the same prose fixture, so the transcript shows the
+  # defect rather than only asserting it was fixed.
+  st_oldn=$(grep -cE 'app\.(get|post|put|delete|all)\(' "$st_rsdir/prose.ts" 2>/dev/null | head -1)
+  st_oldn=${st_oldn:-0}
+  if [ "$st_oldn" -eq 2 ]; then
+    row "selftest" "routes" "OK" "$st_oldn" "surface" \
+        "the RETIRED grep counts 2 on that fixture where the truth is 1 — the #57 A5 defect, demonstrated"
+  else
+    row "selftest" "routes" "BAD" "$st_oldn" "surface" \
+        "expected the retired grep to miscount as 2 here; got ${st_oldn} — this fixture no longer demonstrates the defect"
+    st_fail=1
+  fi
+
+  # 19. THE EXIT CODE ITSELF. Every assertion above tests a pure function; none of
   #     them would notice if the exit-code block were deleted. That block is the
   #     one thing this design cites as making the external class falsifiable
   #     rather than decorative, and it was the only thing in the file with no
@@ -2694,6 +2902,183 @@ if [ "$MODE" != "docs-only" ]; then
       done < "$mm_defects"
     fi
   done
+fi
+
+# ---- live cache semantics (#58) ----------------------------------------------
+# THE BOUND, before the rows (#51 A4, #55 A4, #56's section header).
+#
+#   MEASURED: three of the four fixed branches are anonymously reachable and
+#   were 200/404-with-no-Cache-Control against live production before this
+#   cycle's deploy and carry no-store after it. The fourth — /dashboard with a
+#   VALID key — needs a credential no anonymous prober has, and this cycle is
+#   forbidden from registering one in production. Munger's review rejected
+#   shipping it INFERRED when a measurement was available: it was executed both
+#   directions on a local workerd running this exact source against a local D1
+#   seeded with one api_keys row (pre: no Cache-Control, post: no-store). That
+#   is a measurement of the branch, not of production.
+#
+#   NOT MEASURED, AND NOT MEASURABLE FROM HERE: that any cache would have
+#   stored any of these. We emit no ETag, no Last-Modified and no Expires, so a
+#   heuristic has nothing to compute from; cf-cache-status was absent from all
+#   sixteen rows of the sweep; and we read our own endpoints with curl, which
+#   has no cache. This section proves an obligation is now met. It does NOT
+#   prove a stale read was ever prevented, and a record claiming so would be a
+#   fabricated harm.
+#
+# The three `heuristic` rows are the over-fire control and they are the reason
+# this section can go red. /dashboard-with-no-key is the sharpest of them: it is
+# the SAME ROUTE as two of the fixed rows, one call site away, so it fails on
+# exactly the wrong implementation this fix invites — one header for the route.
+if [ "$MODE" != "docs-only" ]; then
+  echo
+  echo "CACHE SEMANTICS   (RFC 9111 §4.2.2 · §5.2.2.5 · RFC 9110 §15.1)"
+  hr
+  for cs_case in \
+    "/health|no-store|liveness: the body IS the current time" \
+    "/postmortem/hits|no-store|a live counter; its value is the count as of now" \
+    "/dashboard?key=ogforge-gate-no-such-key|no-store|a key-dependent 404 — one caller's verdict" \
+    "/|heuristic|over-fire control: the landing page must stay storable" \
+    "/register|heuristic|over-fire control: a static form must stay storable" \
+    "/dashboard|heuristic|over-fire control, SAME ROUTE as two rows above — catches a route-wide header"
+  do
+    cs_path=${cs_case%%|*}; cs_rest=${cs_case#*|}
+    cs_exp=${cs_rest%%|*};  cs_desc=${cs_rest#*|}
+    cs_file="$WORKDIR/cache-$(printf '%s' "$cs_path" | tr -c 'A-Za-z0-9' '-').hdr"
+    # NEVER -L (#39): -D would then describe whatever answered last.
+    curl -sS --compressed --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" \
+         -A "$UA" -D "$cs_file" -o /dev/null "${BASE}${cs_path}" 2>/dev/null || :
+    cs_defects="$WORKDIR/cache-defects-$$.txt"
+    cache_semantics_defects "$cs_file" "$cs_exp" > "$cs_defects"
+    cs_st=$(grep -i '^HTTP/' "$cs_file" 2>/dev/null | tail -1 | tr -d '\r' | awk '{print $2}')
+    cs_n=$(grep -c . "$cs_defects" 2>/dev/null | head -1); cs_n=${cs_n:-0}
+    TOTAL=$((TOTAL + 1))
+    if [ "$cs_n" -eq 0 ]; then
+      PASSED=$((PASSED + 1))
+      # Print the value beside the verdict so the two can contradict each other
+      # in the transcript rather than the verdict standing alone (#54 A4).
+      cs_cc=$(grep -i '^Cache-Control:' "$cs_file" 2>/dev/null | head -1 | tr -d '\r' \
+              | sed -e 's/^[Cc]ache-[Cc]ontrol:[[:space:]]*//')
+      row "$cs_path" "cache" "PASS" "${cs_st:-?}" "semantics" \
+          "${cs_desc} — Cache-Control: [${cs_cc:-none}]"
+    else
+      FAILED=$((FAILED + 1))
+      row "$cs_path" "cache" "FAIL" "${cs_st:-?}" "semantics" "${cs_desc} — ${cs_n} defect(s)"
+      while IFS= read -r cs_d; do
+        [ -n "$cs_d" ] || continue
+        row "" "cache" "" "" "" "  $cs_d"
+        printf '%s\t%s\t%s\t%s\n' "$cs_path" "cache" "${BASE}${cs_path}" "$cs_d" >> "$FAILLOG"
+      done < "$cs_defects"
+    fi
+  done
+fi
+
+# ---- route surface (#57 A5, fixed here) --------------------------------------
+# WHAT WAS WRONG WITH THE OLD INVARIANT. For twenty-three cycles the public
+# surface was asserted by two greps pasted into consensus.md:
+#
+#   grep -oE 'app\.(get|post|put|delete|all)\([^,)]*' src/index.ts | … | wc -l   # 16
+#   grep -cE 'app\.(get|post|put|delete|all)\('       src/index.ts               # 18
+#
+# Two defects, both found by #57 and both fixed here rather than in the cycle
+# whose work the instrument certified:
+#
+#  1. IT MATCHES PROSE. A comment #57 drafted contained the literal `app.get(`
+#     and moved the numbers to 17/19. It counts STRINGS IN A FILE, not routes in
+#     a router — #37's question ("is this command the program its name implies?")
+#     aimed at a grep. Fixed by stripping line comments before matching, which
+#     the self-test pins with a fixture containing exactly that prose.
+#  2. IT UNDER-MEASURED BY CONSTRUCTION. #57 turned route registration into
+#     automatic public disclosure: every registered path now publishes its
+#     methods in an `Allow` header. The observable surface grew by fifteen
+#     declarations and both numbers sat still, because neither counts methods.
+#     Fixed by counting METHOD/PATH PAIRS and printing the derived Allow set —
+#     the thing a stranger can actually observe.
+#
+# It is asserted as a SET, not a count. A count says two numbers matched; a set
+# says which pairs, so a route swapped for another cannot cancel out. The count
+# is printed beside it so the two can contradict each other (#54 A4).
+#
+# NOT DONE HERE, AND NAMED SO IT IS NOT MISTAKEN FOR DONE: this reads the
+# source, so it proves the pair set is what we wrote — not that the router
+# registered it. #57's METHOD SEMANTICS section probes six of these paths live
+# and is the only part that testifies about the router. Extending that to all
+# sixteen is the next rung and is #59's, not a same-cycle addition to the
+# instrument that just certified this cycle.
+if [ "$MODE" != "docs-only" ] && [ -f "$REPO_ROOT/src/index.ts" ]; then
+  echo
+  echo "ROUTE SURFACE   (#57 A5 — method/path pairs, comments stripped)"
+  hr
+  rs_expected="$WORKDIR/routes-expected.txt"
+  rs_actual="$WORKDIR/routes-actual.txt"
+  # The literal each side is compared against. Changing a route means changing
+  # this list in the same commit, on purpose, which is the point.
+  cat > "$rs_expected" <<'ROUTES'
+GET /
+GET /brand.png
+GET /dashboard
+GET /demo.png
+GET /favicon.ico
+GET /favicon.svg
+GET /health
+GET /interest
+GET /og
+GET /postmortem/hits
+GET /postmortem/self-certifying-ci-gate
+GET /postmortem/self-certifying-ci-gate/
+GET /register
+GET /robots.txt
+GET /sitemap.xml
+POST /admin/upgrade
+POST /interest
+POST /register
+ROUTES
+  route_pairs "$REPO_ROOT/src/index.ts" > "$rs_actual"
+  rs_n=$(grep -c . "$rs_actual" 2>/dev/null | head -1); rs_n=${rs_n:-0}
+  rs_want=$(grep -c . "$rs_expected" 2>/dev/null | head -1); rs_want=${rs_want:-0}
+  rs_paths=$(awk '{print $2}' "$rs_actual" 2>/dev/null | sort -u | grep -c . | head -1)
+  rs_paths=${rs_paths:-0}
+  TOTAL=$((TOTAL + 1))
+  # An empty extraction is the failure this whole file exists to catch: it would
+  # otherwise diff clean against nothing and read as a pass (#41).
+  if [ "$rs_n" -eq 0 ]; then
+    FAILED=$((FAILED + 1))
+    row "src/index.ts" "routes" "FAIL" "0" "surface" \
+        "extracted ZERO route pairs — the matcher is broken, not the source"
+    printf '%s\t%s\t%s\t%s\n' "src/index.ts" "routes" "$REPO_ROOT/src/index.ts" \
+      "zero pairs extracted" >> "$FAILLOG"
+  elif diff -q "$rs_expected" "$rs_actual" >/dev/null 2>&1; then
+    PASSED=$((PASSED + 1))
+    row "src/index.ts" "routes" "PASS" "$rs_n" "surface" \
+        "${rs_n} method/path pairs over ${rs_paths} distinct paths, exact set match"
+  else
+    FAILED=$((FAILED + 1))
+    row "src/index.ts" "routes" "FAIL" "$rs_n" "surface" \
+        "surface changed: ${rs_n} pairs / ${rs_paths} paths, expected ${rs_want} — update the literal in this script in the same commit"
+    diff "$rs_expected" "$rs_actual" 2>/dev/null | while IFS= read -r rs_d; do
+      case "$rs_d" in
+        '<'*|'>'*) row "" "routes" "" "" "" "  $rs_d" ;;
+      esac
+    done
+    printf '%s\t%s\t%s\t%s\n' "src/index.ts" "routes" "$REPO_ROOT/src/index.ts" \
+      "route pair set differs from the asserted literal" >> "$FAILLOG"
+  fi
+  # The Allow surface #57 created and the old greps could not see. Printed, not
+  # asserted: the assertion that matters is the live one in METHOD SEMANTICS.
+  echo "  derived Allow surface (${rs_paths} paths, HEAD synthesized where GET is registered):"
+  awk '{m[$2]=m[$2]" "$1} END {for (p in m) print p, m[p]}' "$rs_actual" 2>/dev/null \
+    | sort | while read -r rs_p rs_ms; do
+        # Flatten to a single space-delimited line BEFORE testing membership.
+        # The first version tested `case " $rs_set " in *" GET "*` against a
+        # NEWLINE-separated list, so the pattern's trailing space never matched
+        # a method followed by a line break: /register and /interest printed
+        # "GET, POST" while production serves "GET, HEAD, POST". Caught only by
+        # comparing this output against the live Allow values measured earlier
+        # in the cycle — the derivation was self-consistent and wrong (#51).
+        rs_set=$(printf '%s\n' $rs_ms | sort -u | tr '\n' ' ')
+        case " $rs_set " in *" GET "*) rs_set="$rs_set HEAD" ;; esac
+        printf '    %-42s Allow: %s\n' "$rs_p" \
+          "$(printf '%s\n' $rs_set | sort -u | tr '\n' ',' | sed -e 's/,$//' -e 's/,/, /g')"
+      done
 fi
 
 if [ "$RUN_DOCS" -eq 1 ]; then

@@ -122,6 +122,82 @@ function htmlResponse(
 // because it survives a page whose head we forget to mark.
 const NOINDEX_HEADER = { 'X-Robots-Tag': 'noindex, nofollow' };
 
+// ── Cycle #58: what does the SET of responses disclose that no single one does?
+// #57 asked whether one status code was true. The next rung down is not another
+// response — it is the whole surface at once. Swept live before this change,
+// every path, reading only Cache-Control:
+//
+//   public, max-age=86400, s-maxage=604800   /brand.png  /demo.png
+//   public, max-age=86400                    /favicon.svg
+//   public, max-age=3600                     /robots.txt  /sitemap.xml
+//   (none)                                   /  /postmortem/…  /postmortem/hits
+//                                            /register  /dashboard  /health
+//                                            /interest(302)  /favicon.ico(301)
+//                                            404  405
+//
+// (plus, not visible to an anonymous sweep: `/og`'s 200 carries the same
+// `public, s-maxage` as the PNGs, and its 429 carries `no-store` — #56.)
+//
+// THE FIRST DRAFT OF THIS COMMENT WAS WRONG AND MUNGER KILLED IT. It read: the
+// split is ASSET TYPE, not semantics — every path carrying a directive is a
+// static file. That is refuted by this file, forty lines up: `/og`'s 429 is
+// `no-store` and is not a file, and `/og`'s 200 carries `max-age` on a PNG this
+// worker just generated. Worse, the taxonomy treats ten absences as ten
+// decisions. **The presence of a header is a decision; its absence is not.**
+// The sweep found five decisions and ten non-decisions, and calling that a
+// classification scheme reads a policy into a default.
+//
+// What survives, and it is the smaller and truer claim: every directive above
+// was argued at its own call site, in its own cycle, about its own response —
+// and no cycle ever asked the question across all responses at once. So the
+// responses whose value IS currency or specific to one caller inherit Hono's
+// `c.json`/`htmlResponse` default, which nobody chose for them, and which is
+// exactly right for `/` and `/register` in the same list. Reading one row at a
+// time cannot show this: `/health` alone looks like a forgotten header. Only
+// the set shows that nothing was forgotten, because nothing was ever asked.
+//
+// Default does not mean uncacheable. RFC 9111 §4.2.2, fetched this cycle:
+//
+//   "Since origin servers do not always provide explicit expiration times, a
+//    cache MAY assign a heuristic expiration time when an explicit time is not
+//    specified… heuristics can only be used on responses without explicit
+//    freshness whose status codes are defined as 'heuristically cacheable'"
+//
+// RFC 9110 line 6953 makes 200 heuristically cacheable and line 7597 does the
+// same for 404, so all four responses below are eligible today. The obvious
+// objection — "`/dashboard?key=…` has a query string, caches leave those alone"
+// — is answered by that same section's closing Note, which is why it is quoted
+// rather than paraphrased:
+//
+//   "*Note:* A previous version of the HTTP specification (Section 13.9 of
+//    [RFC2616]) prohibited caches from calculating heuristic freshness for URIs
+//    with query components… In practice, this has not been widely implemented.
+//    Therefore, origin servers are encouraged to send explicit directives…"
+//
+// `no-store` rather than `no-cache` (RFC 9111 §5.2.2.5): `no-cache` means store
+// it but revalidate, and we serve no ETag and no Last-Modified anywhere, so
+// every revalidation could only be a full refetch. `no-store` alone rather than
+// `private, no-store`: §5.2.2.5 binds "both private and shared caches", so
+// `private` beside it would be inert — #56 A3's lesson (a `Vary` that does no
+// work on a `no-store` response) aimed at this cycle's own addition instead of
+// at inherited code.
+//
+// THE BOUND, stated here so no cycle record can overstate this (#35, #55 A4).
+// MEASURED: these four responses carried no Cache-Control before this change
+// and carry `no-store` after it, live, and three of the four over-fire controls
+// (`/`, `/register`, `/dashboard` with no key) still carry none.
+// NOT MEASURED, and NOT MEASURABLE FROM HERE: that any cache anywhere would
+// have stored them. We serve no ETag, no Last-Modified and no Expires, so a
+// heuristic has nothing to compute a lifetime from; `cf-cache-status` is absent
+// from all sixteen rows; and we read our own endpoints with `curl`, which has
+// no cache at all. So this fixes an OBLIGATION, not an observed staleness. If a
+// later record claims a stale read was prevented, that is a fabricated harm —
+// the honest claim is the one RFC 9111 §4.2.2 itself makes, that origin servers
+// are "encouraged to send explicit directives" precisely because what an
+// intermediary will do cannot be predicted from here.
+const NO_STORE_HEADER = { 'Cache-Control': 'no-store' };
+const NOINDEX_NO_STORE = { ...NOINDEX_HEADER, ...NO_STORE_HEADER };
+
 // Validate an API key from request and return the DB row, or null
 async function resolveApiKey(
   db: D1Database,
@@ -356,6 +432,22 @@ app.get('/postmortem/hits', async c => {
   // it is the only mechanism this endpoint has. It replaces `Disallow:
   // /postmortem/hits`, which kept the crawler from reading any directive at all.
   c.header('X-Robots-Tag', 'noindex, nofollow');
+  // #58. A live counter: its value is the count AS OF NOW, so a stored copy is
+  // a confident wrong answer rather than an old one.
+  //
+  // THE DRAFT'S REASON WAS FALSE AND IS RECORDED HERE RATHER THAN DELETED. It
+  // said: this is our own instrument, so a cached read would give us a false
+  // "zero delta" meaning "cache", not "no traffic". That harm cannot occur on
+  // the reader named — every cycle reads this with `curl`, which has no cache,
+  // and `cf-cache-status` is absent from all sixteen rows of this cycle's
+  // sweep. The header protects a THIRD-PARTY reader (a browser, a proxy), not
+  // us. Writing our own instrument into the justification made the fix sound
+  // urgent and made the reasoning unfalsifiable in our own favour, which is the
+  // shape this repo exists to catch.
+  //
+  // Set before the `try` so the 500 branch inherits it too: a cached failure is
+  // worse than a cached success, because it outlives the outage that made it.
+  c.header('Cache-Control', 'no-store');
   try {
     const { results } = await c.env.DB.prepare(
       `SELECT ref_host, COUNT(*) AS hits, MIN(day) AS first_day, MAX(day) AS last_day
@@ -1001,9 +1093,25 @@ app.get('/dashboard', async c => {
     );
   }
 
+  // #58. From here down the representation is selected by a secret in the URL,
+  // so both remaining branches are per-caller and neither may be stored. Note
+  // that the branch ABOVE — no key at all — is deliberately left with no
+  // Cache-Control: it is a static "enter your key" page in the same class as
+  // `/` and `/register`, where the default is right. That is not tidiness, it
+  // is the over-fire control, and it is structural rather than asserted: a
+  // change that no-stored the whole route would have to touch a third call
+  // site. The gate re-measures it after every deploy and expects NONE.
   const apiKey = await resolveApiKey(c.env.DB, rawKey);
   if (!apiKey) {
-    return htmlResponse(errorPage(404, 'API key not found'), 404, NOINDEX_HEADER);
+    // The reason is key-dependent representation, NOT secrecy. `no-store` hides
+    // nothing: this 404 and the keyed 200 are already a perfect existence
+    // oracle to whoever sent the request, and storage does not change that by
+    // one bit — the same confusion #57 A2 vetoed. It is here because a cache
+    // must not answer a second caller's key with the verdict on a first one's.
+    // Its sibling 404s (a path with no route) stay heuristically cacheable and
+    // correctly so; the two are byte-similar and now differ in exactly one
+    // header, which is deliberate and not drift.
+    return htmlResponse(errorPage(404, 'API key not found'), 404, NOINDEX_NO_STORE);
   }
 
   const refreshed = await maybeResetUsage(c.env.DB, apiKey);
@@ -1020,7 +1128,10 @@ app.get('/dashboard', async c => {
   return htmlResponse(
     dashboardPage(origin(c.req.url), refreshed, recent?.cnt ?? 0),
     200,
-    NOINDEX_HEADER
+    // One caller's usage count, limit and reset date. The key itself is masked
+    // in the body (`key_prefix••••`), so this is not a credential leak — it is
+    // account state, which is reason enough on its own.
+    NOINDEX_NO_STORE
   );
 });
 
@@ -1162,7 +1273,14 @@ app.get('/sitemap.xml', c => {
   });
 });
 
-app.get('/health', c => c.json({ ok: true, ts: new Date().toISOString() }));
+// The whole content of this response is "I am alive, and it is now". A stored
+// copy of it is not a stale answer to the question — it is a confident wrong
+// one, because the field a reader would use to notice staleness (`ts`) is
+// itself the thing that got frozen. Of the four responses this cycle marks, it
+// is the one where heuristic caching could not produce anything true.
+app.get('/health', c =>
+  c.json({ ok: true, ts: new Date().toISOString() }, 200, NO_STORE_HEADER)
+);
 
 // ── Cycle #57: is the STATUS CODE true? ───────────────────────────────────────
 // For 56 cycles `POST /` returned 404. Measured this cycle, before the fix:
