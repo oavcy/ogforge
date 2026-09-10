@@ -562,8 +562,8 @@ retry_semantics_defects() { # headers-file  condition(transient|permanent)
 # exceptions of any kind. One rule. An exception list here would also have been
 # a hand-maintained table thirty lines below a comment rejecting hand-maintained
 # tables.
-method_semantics_defects() { # headers-file  request-method  expectation(disclosed|absent)
-  _mf="$1"; _mmeth="$2"; _mexp="$3"
+method_semantics_defects() { # headers-file  request-method  expectation(disclosed|absent)  expected-allow
+  _mf="$1"; _mmeth="$2"; _mexp="$3"; _mwant="$4"
   # An unfetched response makes every verdict below vacuous (#41). Report and
   # fail; never let a dead fetch read as a pass.
   [ -s "$_mf" ] || { echo "UNREADABLE: no response headers captured"; return 0; }
@@ -636,6 +636,45 @@ method_semantics_defects() { # headers-file  request-method  expectation(disclos
           *) echo "NOT-A-METHOD: Allow lists '${_mtok}', which is not an HTTP method — a framework's internal wildcard marker reaching the wire is the usual cause" ;;
         esac
       done
+
+      # THE CROSS-INSTRUMENT ASSERTION (#59) — every clause above tests the
+      # SHAPE of the header; this one tests its VALUE against what the source
+      # declares. Nothing did that for two cycles, and the gap has a name:
+      # UNDER-DISCLOSURE IS INVISIBLE TO EVERY CLAUSE ABOVE. Let the router
+      # serve `Allow: GET, HEAD` for /register while src/index.ts registers GET
+      # and POST, and the response is a 405, with exactly one Allow, non-empty,
+      # syntactically a token list, every token a real method, no ALL, HEAD
+      # present beside GET, and not listing the refused method. Seven clauses
+      # pass. The header is still wrong, and the client is told a POST endpoint
+      # does not exist.
+      #
+      # THE EXPECTATION MUST COME FROM THE SOURCE, NEVER FROM THE RESPONSE.
+      # Deriving it from "$_mal" is the accident that would make this clause
+      # unfalsifiable while looking identical in the transcript, so the value
+      # arrives as an argument computed by derive_allow_map() from the route
+      # pairs, and this function never sees src/index.ts.
+      case "$_mwant" in
+        # A fixture that is aiming at one of the shape clauses above and has no
+        # source to derive from. Spelled explicitly rather than left blank, so
+        # that "no expectation" and "expectation came back empty" cannot look
+        # the same to a reader or to the code.
+        '-') ;;
+        # The empty case is NOT skipped, because "" = "" would compare two dead
+        # inputs and pass (#41: index_parity=0 on two empty lists). If the
+        # derivation produced nothing, that is a broken instrument, not a clean
+        # route.
+        '') echo "UNREADABLE-DERIVATION: no expected Allow was derived from src/index.ts for this path, so an equality test here would compare two empty strings and pass" ;;
+        *)
+          # Order and spacing are not semantic in a #method list, so normalise
+          # both sides the same way and compare sets, not strings.
+          _mgotset=$(printf '%s' "$_mal" | tr -d ' \r' | tr ',' '\n' | grep -v '^$' \
+                     | sort -u | tr '\n' ',' | sed -e 's/,$//')
+          _mwantset=$(printf '%s' "$_mwant" | tr -d ' \r' | tr ',' '\n' | grep -v '^$' \
+                      | sort -u | tr '\n' ',' | sed -e 's/,$//')
+          [ "$_mgotset" = "$_mwantset" ] || \
+            echo "ALLOW-DISAGREES-WITH-SOURCE: the router served '${_mal}' but src/index.ts declares '${_mwant}' — one of the two instruments is wrong and until now neither could see the other"
+          ;;
+      esac
       ;;
 
     absent)
@@ -680,6 +719,89 @@ route_pairs() { # source-file
     | sed -E "s@^([a-z]+) POSTMORTEM_PATH\$@\1 /postmortem/self-certifying-ci-gate@" \
     | awk 'NF==2 {print toupper($1), $2}' \
     | sort
+}
+
+# Turn a route-pair list into the Allow header each path OUGHT to serve:
+# "<path><TAB><Allow value>", one per line, sorted by path.
+#
+# THIS IS THE ONLY DERIVATION IN THIS FILE, and that is the point of extracting
+# it (#59). It used to live inline inside ROUTE SURFACE's print loop, where its
+# comment described it as decorative: "Printed, not asserted: the assertion that
+# matters is the live one in METHOD SEMANTICS." That was false in a way neither
+# section could see. METHOD SEMANTICS never compared the live Allow to this
+# value — it only checked the header's SHAPE — so the derived surface was
+# printed and never asserted, while the live surface was asserted and never
+# compared. Two instruments about one fact, both green, never confronted with
+# each other (#51, aimed at the instruments instead of at the pages).
+#
+# HEAD is synthesized here rather than read from the source because it is never
+# in `app.routes` at all: Hono rewrites a HEAD request into a GET at dispatch
+# (`node_modules/hono/dist/hono-base.js:273`). So the source of truth for Allow
+# is the registration list PLUS that one rule, and this function is where the
+# rule lives. RFC 9110 §9.1 (line 3794) makes HEAD mandatory regardless.
+# THE HAND-MAINTAINED LITERAL — the third point that makes the other two able to
+# disagree (#59, on Munger's amendment). It is deliberately typed out and
+# deliberately not generated.
+#
+# The first draft of this cycle derived METHOD SEMANTICS' expected Allow from
+# route_pairs(src/index.ts) — the same call ROUTE SURFACE compares against this
+# literal. That is not circular against the response, which is the trap I went
+# looking for; it is circular against ITSELF. A source edit moves the derived
+# expectation and the live router together, in step, so the new live assertion
+# stays green through any route change and only the literal diff goes red. One
+# edge, doing the work of two.
+#
+# Anchored here instead, the three points are: this literal, the source, and the
+# router. ROUTE SURFACE tests literal↔source. METHOD SEMANTICS tests literal↔live.
+# Either edge can fail without the other, which is the whole reason to have two
+# sections. Changing a route means changing this list in the same commit — on
+# purpose, by a person, which is the point (#57 A2 is about hand-maintained
+# EXCEPTION tables inside a truthfulness rule; this is a hand-maintained
+# EXPECTATION, and an expectation nobody has to type is one nobody has to mean).
+expected_route_pairs() {
+  cat <<'ROUTES'
+GET /
+GET /brand.png
+GET /dashboard
+GET /demo.png
+GET /favicon.ico
+GET /favicon.svg
+GET /health
+GET /interest
+GET /og
+GET /postmortem/hits
+GET /postmortem/self-certifying-ci-gate
+GET /postmortem/self-certifying-ci-gate/
+GET /register
+GET /robots.txt
+GET /sitemap.xml
+POST /admin/upgrade
+POST /interest
+POST /register
+ROUTES
+}
+
+derive_allow_map() { # route-pairs-file
+  awk '
+    NF == 2 {
+      p = $2; m = toupper($1)
+      if (index(" " seen[p] " ", " " m " ") == 0) seen[p] = seen[p] " " m
+    }
+    END {
+      for (p in seen) {
+        if (index(" " seen[p] " ", " GET ") > 0 && index(" " seen[p] " ", " HEAD ") == 0)
+          seen[p] = seen[p] " HEAD"
+        # A single space as the separator is awks special case: split on runs of
+        # whitespace and drop leading/trailing, so the leading space above is safe.
+        n = split(seen[p], a, " ")
+        for (i = 2; i <= n; i++) { v = a[i]; j = i - 1
+          while (j > 0 && a[j] > v) { a[j+1] = a[j]; j-- }
+          a[j+1] = v }
+        out = ""
+        for (i = 1; i <= n; i++) out = (i == 1 ? a[i] : out ", " a[i])
+        printf "%s\t%s\n", p, out
+      }
+    }' "$1" 2>/dev/null | sort
 }
 
 cache_semantics_defects() { # headers-file  expectation(no-store|heuristic)
@@ -1845,28 +1967,38 @@ self_test() {
   printf 'HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD\r\n\r\n' > "$st_mmdir/overreach.txt"
   : > "$st_mmdir/unfetchable.txt"
 
+  # Field 5 is the EXPECTED Allow, as derive_allow_map() would emit it from the
+  # literal. `-` means "this fixture is aiming at one of the shape clauses and
+  # has no source-side expectation"; an EMPTY field means the derivation came
+  # back with nothing, which must be a defect and not a skip.
   for st_case in \
-    "1|pre57-post-root.txt|POST|disclosed|the 404 POST / served until #57 — the status lie itself" \
-    "1|pre57-options-root.txt|OPTIONS|disclosed|the 404 OPTIONS / served until #57" \
-    "0|good-405-get.txt|POST|disclosed|post-fix 405 on a GET-only path must be clean" \
-    "0|good-405-getpost.txt|PUT|disclosed|post-fix 405 on a GET+POST path must be clean" \
-    "0|good-405-postonly.txt|GET|disclosed|post-fix 405 on the POST-only operator path must be clean" \
-    "0|good-absent.txt|POST|absent|a genuinely absent path must still read 404, or the fix over-fired" \
-    "1|no-allow.txt|POST|disclosed|405 without Allow is rejected (§15.5.6 and §10.2.1 MUST)" \
-    "1|empty-allow.txt|POST|disclosed|an empty Allow claims the resource allows no methods" \
-    "1|contradicts.txt|POST|disclosed|a 405 whose Allow lists the refused method is rejected" \
-    "1|omits-head.txt|POST|disclosed|Allow: GET without HEAD is rejected (§9.1)" \
-    "2|malformed.txt|POST|disclosed|a semicolon-joined Allow is rejected twice: bad syntax, and 'GET;' is not a method" \
-    "1|duplicate.txt|PUT|disclosed|two Allow headers are rejected — send one list" \
-    "1|all-token.txt|POST|disclosed|Allow: ALL is rejected — the exact header the vetoed path filter would have served" \
-    "2|overreach.txt|POST|absent|a 405 on a path with no route is rejected: status and stray Allow" \
-    "1|unfetchable.txt|POST|disclosed|an uncaptured response reports UNREADABLE, never a pass"
+    "1|pre57-post-root.txt|POST|disclosed|-|the 404 POST / served until #57 — the status lie itself" \
+    "1|pre57-options-root.txt|OPTIONS|disclosed|-|the 404 OPTIONS / served until #57" \
+    "0|good-405-get.txt|POST|disclosed|-|post-fix 405 on a GET-only path must be clean" \
+    "0|good-405-getpost.txt|PUT|disclosed|-|post-fix 405 on a GET+POST path must be clean" \
+    "0|good-405-postonly.txt|GET|disclosed|-|post-fix 405 on the POST-only operator path must be clean" \
+    "0|good-absent.txt|POST|absent|-|a genuinely absent path must still read 404, or the fix over-fired" \
+    "1|no-allow.txt|POST|disclosed|-|405 without Allow is rejected (§15.5.6 and §10.2.1 MUST)" \
+    "1|empty-allow.txt|POST|disclosed|-|an empty Allow claims the resource allows no methods" \
+    "1|contradicts.txt|POST|disclosed|-|a 405 whose Allow lists the refused method is rejected" \
+    "1|omits-head.txt|POST|disclosed|-|Allow: GET without HEAD is rejected (§9.1)" \
+    "2|malformed.txt|POST|disclosed|-|a semicolon-joined Allow is rejected twice: bad syntax, and 'GET;' is not a method" \
+    "1|duplicate.txt|PUT|disclosed|-|two Allow headers are rejected — send one list" \
+    "1|all-token.txt|POST|disclosed|-|Allow: ALL is rejected — the exact header the vetoed path filter would have served" \
+    "2|overreach.txt|POST|absent|-|a 405 on a path with no route is rejected: status and stray Allow" \
+    "1|unfetchable.txt|POST|disclosed|-|an uncaptured response reports UNREADABLE, never a pass" \
+    "1|good-405-get.txt|POST|disclosed|GET, HEAD, POST|THE POISONED ROW: Allow GET,HEAD against a source declaring POST too. Under-disclosure passes all seven shape clauses — if this fixture is not RED the equality test is not wired" \
+    "1|good-405-getpost.txt|PUT|disclosed|GET, HEAD|over-disclosure: the router claims POST and the source does not declare it" \
+    "0|good-405-getpost.txt|PUT|disclosed|POST,HEAD,GET|equality is on the SET: order and spacing are not semantic in a #method list" \
+    "0|good-405-postonly.txt|GET|disclosed|POST|the POST-only operator path agrees with the literal" \
+    "1|good-405-get.txt|POST|disclosed||AN UNRESOLVED EXPECTATION IS A DEFECT, NOT A SKIP: comparing '' to a parsed '' would pass on two dead inputs (#41), and the trailing-slash twin is how a loose lookup produces exactly that"
   do
     st_want=${st_case%%|*}; st_rest=${st_case#*|}
     st_file=${st_rest%%|*}; st_rest=${st_rest#*|}
     st_mth=${st_rest%%|*};  st_rest=${st_rest#*|}
-    st_exp=${st_rest%%|*};  st_desc=${st_rest#*|}
-    st_got=$(method_semantics_defects "$st_mmdir/$st_file" "$st_mth" "$st_exp" | grep -c . | head -1)
+    st_exp=${st_rest%%|*};  st_rest=${st_rest#*|}
+    st_wal=${st_rest%%|*};  st_desc=${st_rest#*|}
+    st_got=$(method_semantics_defects "$st_mmdir/$st_file" "$st_mth" "$st_exp" "$st_wal" | grep -c . | head -1)
     if [ "$st_got" = "$st_want" ]; then
       row "selftest" "method" "OK" "$st_got" "semantics" "$st_desc"
     else
@@ -2860,25 +2992,82 @@ if [ "$MODE" != "docs-only" ]; then
   echo
   echo "METHOD SEMANTICS   (RFC 9110 §15.5.5 · §15.5.6 MUST · §10.2.1 MUST · §9.1)"
   hr
-  for mm_case in \
-    "/|POST|disclosed|the front door, in our own sitemap" \
-    "/|OPTIONS|disclosed|a method we do not implement; 405+Allow is the honest answer (§9.1)" \
-    "/health|PUT|disclosed|liveness" \
-    "/sitemap.xml|POST|disclosed|a published document" \
-    "/register|PUT|disclosed|a GET+POST path — Allow must list both" \
-    "/admin/upgrade|GET|disclosed|the POST-only operator path — one rule, no exceptions" \
-    "/ogforge-gate-no-such-path|POST|absent|over-fire control: no route, so 404 is TRUE"
-  do
-    mm_path=${mm_case%%|*}; mm_rest=${mm_case#*|}
-    mm_meth=${mm_rest%%|*}; mm_rest=${mm_rest#*|}
-    mm_exp=${mm_rest%%|*};  mm_desc=${mm_rest#*|}
+  # EVERY registered path, not a chosen six (#59). #57 probed six and #58 named
+  # the gap in writing: "ROUTE SURFACE reads the SOURCE — it proves the pair set
+  # is what we wrote, not that the router registered it. Only METHOD SEMANTICS
+  # testifies about the router, and it probes 6 of 16 paths."
+  #
+  # THE PATH LIST AND THE PROBE METHOD ARE BOTH DERIVED, NOT TYPED. A hand-kept
+  # list of six paths and their probe methods is a second source of truth free to
+  # drift from the first (#43: a comment is not an implementation), and its
+  # failure mode is silence — add a seventeenth route and a typed list keeps
+  # passing while saying nothing about it. The paths come from derive_allow_map()
+  # and the probe method is the first one this path does NOT register, so a new
+  # route is probed the first time the gate runs after it is added.
+  #
+  # DERIVED FROM THE LITERAL, NOT FROM src/index.ts. See expected_route_pairs():
+  # deriving it from the source would move the expectation and the router in step
+  # on every route change, and this edge would never be able to fail alone.
+  mm_pairs="$WORKDIR/method-routes.txt"
+  mm_map="$WORKDIR/method-allow-derived.txt"
+  expected_route_pairs > "$mm_pairs"
+  derive_allow_map "$mm_pairs" > "$mm_map"
+  mm_derived=$(grep -c . "$mm_map" 2>/dev/null | head -1); mm_derived=${mm_derived:-0}
+  mm_probed=0
+
+  # THE GUARD THAT MAKES THE LOOP'S SILENCE AUDIBLE, and it goes first on purpose.
+  # A `for`/`while` over an empty list runs zero times, adds zero checks, fails
+  # nothing, and the SUMMARY line still reads PASS. That is the cheapest way this
+  # entire section becomes decorative: break route_pairs' matcher, or point
+  # REPO_ROOT somewhere without src/index.ts, and sixteen assertions evaporate
+  # without a single red row. Assert the derivation is non-empty BEFORE trusting
+  # anything derived from it.
+  TOTAL=$((TOTAL + 1))
+  if [ "$mm_derived" -eq 0 ]; then
+    FAILED=$((FAILED + 1))
+    row "src/index.ts" "method" "FAIL" "0" "derivation" \
+        "derived Allow for ZERO paths — the loop below would probe nothing and report nothing"
+    printf '%s\t%s\t%s\t%s\n' "src/index.ts" "method" "$REPO_ROOT/src/index.ts" \
+      "derive_allow_map produced no paths" >> "$FAILLOG"
+  else
+    PASSED=$((PASSED + 1))
+    row "src/index.ts" "method" "PASS" "$mm_derived" "derivation" \
+        "expected Allow derived from source for ${mm_derived} paths — every one is probed below"
+  fi
+
+  while IFS="$(printf '\t')" read -r mm_path mm_allow; do
+    [ -n "$mm_path" ] || continue
+    mm_probed=$((mm_probed + 1))
+    mm_exp="disclosed"
+    mm_desc="declared: ${mm_allow}"
+    # Pick a method this path does not register. Comma-fenced and space-free so
+    # membership is exact: a bare *GET* also matches TARGET (#57's normalisation).
+    mm_fence=",$(printf '%s' "$mm_allow" | tr -d ' '),"
+    mm_meth=""
+    for mm_cand in PUT DELETE PATCH OPTIONS POST GET; do
+      case "$mm_fence" in
+        *",${mm_cand},"*) ;;
+        *) mm_meth="$mm_cand"; break ;;
+      esac
+    done
+    # Unreachable while any method stays unregistered somewhere, but a path that
+    # registered all six would otherwise be probed with an EMPTY method string,
+    # and curl -X '' sends GET — a silent pass on a row that tested nothing.
+    if [ -z "$mm_meth" ]; then
+      TOTAL=$((TOTAL + 1)); FAILED=$((FAILED + 1))
+      row "$mm_path" "method" "FAIL" "-" "semantics" \
+          "no unregistered method left to probe with; this row would have tested nothing"
+      printf '%s\t%s\t%s\t%s\n' "$mm_path" "method" "${BASE}${mm_path}" \
+        "no unregistered probe method available" >> "$FAILLOG"
+      continue
+    fi
     mm_file="$WORKDIR/method-$(printf '%s' "${mm_meth}${mm_path}" | tr -c 'A-Za-z0-9' '-').hdr"
     # -X on its own sends the method with no body and does not follow redirects.
     # NEVER add -L here: #39: -w/-D would then describe whatever answered last.
     curl -sS --compressed --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" \
          -A "$UA" -X "$mm_meth" -D "$mm_file" -o /dev/null "${BASE}${mm_path}" 2>/dev/null || :
     mm_defects="$WORKDIR/method-defects-$$.txt"
-    method_semantics_defects "$mm_file" "$mm_meth" "$mm_exp" > "$mm_defects"
+    method_semantics_defects "$mm_file" "$mm_meth" "$mm_exp" "$mm_allow" > "$mm_defects"
     mm_st=$(grep -i '^HTTP/' "$mm_file" 2>/dev/null | tail -1 | tr -d '\r' | awk '{print $2}')
     # Count on its own line, then head -1 (#54: `grep -c` prints 0 AND exits 1).
     mm_n=$(grep -c . "$mm_defects" 2>/dev/null | head -1)
@@ -2901,7 +3090,62 @@ if [ "$MODE" != "docs-only" ]; then
         printf '%s\t%s\t%s\t%s\n' "$mm_path" "method" "${BASE}${mm_path}" "$mm_d" >> "$FAILLOG"
       done < "$mm_defects"
     fi
-  done
+    # Redirected, never piped: a `... | while read` loop runs in a subshell and
+    # every TOTAL/PASSED/FAILED increment above would be discarded at `done`,
+    # leaving a section that prints sixteen rows and contributes zero checks.
+  done < "$mm_map"
+
+  # THE COVERAGE ROW (#44 A1: a number without its coverage is not a measurement).
+  # The rows above can only testify about paths the loop actually reached. If the
+  # map holds sixteen paths and the loop ran four times — a truncated read, a
+  # path containing a newline, an early `continue` — the four would all pass and
+  # the transcript would look complete. Stating both numbers lets them disagree.
+  TOTAL=$((TOTAL + 1))
+  if [ "$mm_probed" -eq "$mm_derived" ] && [ "$mm_derived" -gt 0 ]; then
+    PASSED=$((PASSED + 1))
+    row "src/index.ts" "method" "PASS" "$mm_probed" "coverage" \
+        "probed ${mm_probed} of ${mm_derived} declared paths live — #58 probed 6 of 16"
+  else
+    FAILED=$((FAILED + 1))
+    row "src/index.ts" "method" "FAIL" "$mm_probed" "coverage" \
+        "probed ${mm_probed} of ${mm_derived} declared paths — the untouched ones are unverified, not clean"
+    printf '%s\t%s\t%s\t%s\n' "src/index.ts" "method" "$REPO_ROOT/src/index.ts" \
+      "probed ${mm_probed} of ${mm_derived} declared paths" >> "$FAILLOG"
+  fi
+
+  # THE OVER-FIRE CONTROL, and it is not decorative just because all sixteen rows
+  # above now assert an exact value. Those rows are all drawn from the derived
+  # map, so every one of them describes a path that HAS a route; none of them can
+  # notice a change that starts answering 405 for paths that have none. A blanket
+  # `return 405` would satisfy sixteen exact-value assertions only if it also
+  # guessed each Allow — but the realistic wrong turn is looser than that: widen
+  # the lookup (a prefix match, a trailing-slash fallback, a catch-all) and the
+  # sixteen keep passing while a nonexistent path starts claiming methods.
+  mm_ctlpath="/ogforge-gate-no-such-path"
+  mm_ctlfile="$WORKDIR/method-control.hdr"
+  curl -sS --compressed --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" \
+       -A "$UA" -X POST -D "$mm_ctlfile" -o /dev/null "${BASE}${mm_ctlpath}" 2>/dev/null || :
+  mm_ctldef="$WORKDIR/method-control-defects-$$.txt"
+  # `-` for the expected Allow: the `absent` branch asserts there is NO Allow at
+  # all, so there is nothing to compare a derived value against.
+  method_semantics_defects "$mm_ctlfile" "POST" "absent" "-" > "$mm_ctldef"
+  mm_ctlst=$(grep -i '^HTTP/' "$mm_ctlfile" 2>/dev/null | tail -1 | tr -d '\r' | awk '{print $2}')
+  mm_ctln=$(grep -c . "$mm_ctldef" 2>/dev/null | head -1); mm_ctln=${mm_ctln:-0}
+  TOTAL=$((TOTAL + 1))
+  if [ "$mm_ctln" -eq 0 ]; then
+    PASSED=$((PASSED + 1))
+    row "POST $mm_ctlpath" "method" "PASS" "${mm_ctlst:-?}" "semantics" \
+        "over-fire control: no route, so 404 with no Allow is the TRUE answer"
+  else
+    FAILED=$((FAILED + 1))
+    row "POST $mm_ctlpath" "method" "FAIL" "${mm_ctlst:-?}" "semantics" \
+        "over-fire control tripped — ${mm_ctln} defect(s)"
+    while IFS= read -r mm_d; do
+      [ -n "$mm_d" ] || continue
+      row "" "method" "" "" "" "  $mm_d"
+      printf '%s\t%s\t%s\t%s\n' "$mm_ctlpath" "method" "${BASE}${mm_ctlpath}" "$mm_d" >> "$FAILLOG"
+    done < "$mm_ctldef"
+  fi
 fi
 
 # ---- live cache semantics (#58) ----------------------------------------------
@@ -3010,28 +3254,11 @@ if [ "$MODE" != "docs-only" ] && [ -f "$REPO_ROOT/src/index.ts" ]; then
   hr
   rs_expected="$WORKDIR/routes-expected.txt"
   rs_actual="$WORKDIR/routes-actual.txt"
-  # The literal each side is compared against. Changing a route means changing
-  # this list in the same commit, on purpose, which is the point.
-  cat > "$rs_expected" <<'ROUTES'
-GET /
-GET /brand.png
-GET /dashboard
-GET /demo.png
-GET /favicon.ico
-GET /favicon.svg
-GET /health
-GET /interest
-GET /og
-GET /postmortem/hits
-GET /postmortem/self-certifying-ci-gate
-GET /postmortem/self-certifying-ci-gate/
-GET /register
-GET /robots.txt
-GET /sitemap.xml
-POST /admin/upgrade
-POST /interest
-POST /register
-ROUTES
+  # The literal each side is compared against — now defined once, near the top,
+  # because METHOD SEMANTICS anchors its live expectation to the SAME list (#59).
+  # When it lived only here, the live check had nothing to anchor to but the
+  # source it was supposed to be independent of.
+  expected_route_pairs > "$rs_expected"
   route_pairs "$REPO_ROOT/src/index.ts" > "$rs_actual"
   rs_n=$(grep -c . "$rs_actual" 2>/dev/null | head -1); rs_n=${rs_n:-0}
   rs_want=$(grep -c . "$rs_expected" 2>/dev/null | head -1); rs_want=${rs_want:-0}
@@ -3062,23 +3289,23 @@ ROUTES
     printf '%s\t%s\t%s\t%s\n' "src/index.ts" "routes" "$REPO_ROOT/src/index.ts" \
       "route pair set differs from the asserted literal" >> "$FAILLOG"
   fi
-  # The Allow surface #57 created and the old greps could not see. Printed, not
-  # asserted: the assertion that matters is the live one in METHOD SEMANTICS.
+  # The Allow surface #57 created and the old greps could not see. It is no
+  # longer "printed, not asserted" — that phrase was this file's own description
+  # of a gap it could not see (#59). derive_allow_map() is now the single
+  # derivation, and METHOD SEMANTICS asserts each of these values against the
+  # live router. Printed here from `rs_actual` — the SOURCE side — so this
+  # listing and the live assertion read from opposite ends of the same claim.
+  #
+  # The inline version this replaces tested `case " $rs_set " in *" GET "*`
+  # against a NEWLINE-separated list, so /register and /interest printed
+  # "GET, POST" while production served "GET, HEAD, POST": self-consistent and
+  # wrong, caught only by comparing it against live values measured elsewhere in
+  # the cycle (#51). Folding it into one function is what stops that from being
+  # possible in one place and not the other.
   echo "  derived Allow surface (${rs_paths} paths, HEAD synthesized where GET is registered):"
-  awk '{m[$2]=m[$2]" "$1} END {for (p in m) print p, m[p]}' "$rs_actual" 2>/dev/null \
-    | sort | while read -r rs_p rs_ms; do
-        # Flatten to a single space-delimited line BEFORE testing membership.
-        # The first version tested `case " $rs_set " in *" GET "*` against a
-        # NEWLINE-separated list, so the pattern's trailing space never matched
-        # a method followed by a line break: /register and /interest printed
-        # "GET, POST" while production serves "GET, HEAD, POST". Caught only by
-        # comparing this output against the live Allow values measured earlier
-        # in the cycle — the derivation was self-consistent and wrong (#51).
-        rs_set=$(printf '%s\n' $rs_ms | sort -u | tr '\n' ' ')
-        case " $rs_set " in *" GET "*) rs_set="$rs_set HEAD" ;; esac
-        printf '    %-42s Allow: %s\n' "$rs_p" \
-          "$(printf '%s\n' $rs_set | sort -u | tr '\n' ',' | sed -e 's/,$//' -e 's/,/, /g')"
-      done
+  derive_allow_map "$rs_actual" | while IFS="$(printf '\t')" read -r rs_p rs_a; do
+    printf '    %-42s Allow: %s\n' "$rs_p" "$rs_a"
+  done
 fi
 
 if [ "$RUN_DOCS" -eq 1 ]; then
