@@ -1221,7 +1221,19 @@ app.get('/dashboard', async c => {
     // Its sibling 404s (a path with no route) stay heuristically cacheable and
     // correctly so; the two are byte-similar and now differ in exactly one
     // header, which is deliberate and not drift.
-    return htmlResponse(errorPage(404, 'API key not found'), 404, NOINDEX_NO_STORE);
+    return htmlResponse(errorPage(
+        404,
+        'API key not found',
+        // Deliberately the SAME sentence bearerChallenge() puts in
+        // `error_description` for the same fact on /og (#63). Two endpoints, two
+        // status codes, one underlying condition: the key presented resolves to
+        // no row. #63 A2's remedy is that the channels of one response agree; the
+        // channels of one FACT agreeing is the same discipline one step out.
+        // Says what the lookup did. Not `invalid`, `inactive` or `no longer
+        // valid` — each implies a state or a transition this schema cannot
+        // represent, which is the #63 A1 defect with new vocabulary.
+        'No API key matches the credential supplied.'
+      ), 404, NOINDEX_NO_STORE);
   }
 
   const refreshed = await maybeResetUsage(c.env.DB, apiKey);
@@ -1290,10 +1302,14 @@ app.get('/favicon.ico', c => c.redirect('/favicon.svg', 301));
 // never read, and the URL can still be listed from an inbound link. Exactly two
 // mechanisms are in play now and they compose instead of cancelling.
 //
-// `Disallow: /admin/` STAYS. Verified this cycle: `/admin/` and `/admin/upgrade`
-// both answer 404 to GET (the only handler is a POST), so there is no page there
-// emitting a directive for this line to suppress. A Disallow with nothing behind
-// it cancels nothing.
+// `Disallow: /admin/` STAYS, and the CONCLUSION survives while the fact behind
+// it does not. #53 wrote "`/admin/` and `/admin/upgrade` both answer 404 to GET";
+// #57 changed that and nobody came back here. Re-measured live in #64:
+// `GET /admin/` -> 404 (no Allow), `GET /admin/upgrade` -> 405 `Allow: POST`.
+// The line still cancels nothing, because what a 405 serves is an error page and
+// an error page emits no robots directive either — but the reason on record was
+// stale for seven cycles. Corrected rather than deleted: a Disallow with nothing
+// behind it is still the right call, and now for a reason that was measured.
 app.get('/robots.txt', c => {
   const site = origin(c.req.url);
   const body = [
@@ -1512,15 +1528,33 @@ app.notFound(c => {
     // the only mandatory methods and every other one OPTIONAL, so 405 is the
     // honest answer to OPTIONS rather than an omission to apologise for. Listing
     // OPTIONS in Allow while refusing it would be the same defect one level in.
-    return htmlResponse(errorPage(405, 'Method not allowed'), 405, {
+    return htmlResponse(errorPage(
+      405,
+      'Method not allowed',
+      // Deliberately does NOT enumerate the allowed methods. That was proposed
+      // and VETOED this cycle: RFC 9110 §15.5.6's MUST is addressed to the
+      // protocol client, which reads headers, so `Allow` above already reaches
+      // the reader it names — its coverage is total and there is no #62 A1 gap
+      // to close. Restating it here would be a new disclosure bundled into a
+      // truthfulness fix, which is #57 A2 one level out.
+      'This address does not accept that request method.'
+    ), 405, {
       Allow: allow,
     });
   }
-  return htmlResponse(errorPage(404, 'Page not found'), 404);
+  return htmlResponse(errorPage(404, 'Page not found', 'No page exists at this address.'), 404);
 });
 app.onError((err, _c) => {
   console.error('Unhandled error:', err);
-  return htmlResponse(errorPage(500, 'Internal server error'), 500);
+  return htmlResponse(errorPage(
+    500,
+    'Internal server error',
+    // UNCHANGED, and it is the control. This is the one branch where the old
+    // sentence was TRUE: an unhandled exception is something going wrong, and a
+    // retry may genuinely succeed. If a future edit makes all four strings
+    // agree, that is the bug returning, not tidiness.
+    'Something went wrong. Try again or check the docs.'
+  ), 500);
 });
 
 export default app;

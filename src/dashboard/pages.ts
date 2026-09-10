@@ -1032,14 +1032,36 @@ export function dashboardPage(
   return layout('Dashboard', body, PRIVATE_HEAD);
 }
 
-export function errorPage(code: number, message: string): string {
+// Cycle #64. `detail` is REQUIRED, not optional, and that is the whole fix.
+//
+// This function used to be `errorPage(code, message)` and hard-coded one closing
+// sentence for every caller: "Something went wrong. Try again or check the docs."
+// Four call sites inherited it. On three of them the first clause is FALSE.
+// Nothing goes wrong when the router answers 405 to a method it does not serve —
+// it did exactly what it was built to do, returned the correct status, and
+// attached a correct `Allow`. The status line said "this is the right answer";
+// the body of the same response said "we broke". Neither #57, which added the
+// 405, nor any cycle since, read the page it was serving: this company has
+// quoted this body's SIZE twice (15,868 B) and its TEXT never.
+//
+// The sentence was authored once for a generic component and was never chosen
+// four times, which is why no cycle could see it — the signature had nowhere to
+// put the answer, so the question could not be asked. Making the parameter
+// REQUIRED is the repair for that, not the new copy: a fifth call site cannot
+// now inherit a claim about our internal state that its own branch has not
+// earned. `code` and `message` never had a default and were never wrong.
+//
+// "Try again" is deliberately NOT part of this finding. It is an imperative —
+// advice, not an assertion — and bad advice is not a false statement. Only
+// "Something went wrong" is truth-apt, and only it was corrected.
+export function errorPage(code: number, message: string, detail: string): string {
   const body = `
   ${nav()}
   <section class="section">
     <div class="container" style="text-align:center;max-width:480px;">
       <p style="font-family:var(--font-mono);font-size:80px;font-weight:700;color:var(--border);line-height:1;">${code}</p>
       <h1 style="font-size:24px;margin:16px 0 12px;">${message}</h1>
-      <p style="color:var(--text-2);margin-bottom:32px;">Something went wrong. Try again or check the docs.</p>
+      <p style="color:var(--text-2);margin-bottom:32px;">${detail}</p>
       <a href="/" class="btn btn-ghost">← Back to home</a>
     </div>
   </section>
